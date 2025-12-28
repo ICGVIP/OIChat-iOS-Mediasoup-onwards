@@ -200,25 +200,53 @@ const NewCallScreen = ({navigation}) => {
     
 
     async function handleCall(type){
-        try {
+        const selectedIds = (selected || []).map(s => s?.id).filter(Boolean);
+        console.log('📱 [NewCall] handleCall called', { type, selectedIds, selectedCount: selectedIds.length });
+        
+        if (selectedIds.length === 0) {
+            console.error('❌ [NewCall] No users selected');
+            return;
+        }
 
-            let reply = await fetch('http://216.126.78.3:8500/api/create_call',{
-                method:'POST',
-                headers:{
-                    'Content-type':'application/json',
-                    'Authorization':`Bearer ${user.token}`
-                },
-                body: JSON.stringify({to: selected[0]?.id, type})
-            });
-            let response = await reply.json();
-            
-            if(response.success){
-                // setInCall(response.id)
-                await startCall(selected[0]?.id, type);
-                setType('Outgoing')
-            }else console.log('Error in creating a call...\n\n')
+        try {
+            if (selectedIds.length === 1) {
+                console.log('🌐 [NewCall] Calling create_call API (1:1)...');
+                let reply = await fetch('http://216.126.78.3:8500/api/create_call',{
+                    method:'POST',
+                    headers:{
+                        'Content-type':'application/json',
+                        'Authorization':`Bearer ${user.token}`
+                    },
+                    body: JSON.stringify({to: selectedIds[0], type})
+                });
+                
+                console.log('📥 [NewCall] API response received', { 
+                    status: reply.status, 
+                    ok: reply.ok 
+                });
+                
+                let response = await reply.json();
+                console.log('📥 [NewCall] API response data:', response);
+                
+                if(response.success){
+                    console.log('✅ [NewCall] API call successful, starting RTC call...');
+                    // setInCall(response.id)
+                    await startCall(selectedIds[0], type);
+                    console.log('✅ [NewCall] startCall completed, setting type to Outgoing');
+                    setType('Outgoing');
+                    console.log('✅ [NewCall] Type set to Outgoing');
+                } else {
+                    console.error('❌ [NewCall] API call failed:', response);
+                }
+            } else {
+                // Group call: start mediasoup call with ALL selected IDs.
+                // VoIP fanout is handled by the calls server (offline users) + incoming-call socket events (online users).
+                console.log('👥 [NewCall] Starting GROUP call via RTC with participants:', selectedIds);
+                await startCall(selectedIds, type);
+                setType('Outgoing');
+            }
         }catch (err) {
-            console.log('Error in starting a call: ', err)
+            console.error('❌ [NewCall] Error in starting a call:', err);
         }
         
     }

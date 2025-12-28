@@ -27,17 +27,37 @@ export const IncomingCall = () => {
   } = useRTC();
 
   const { contacts } = useSelector((state) => state.contacts.value);
+  const user = useSelector((state) => state.user.value);
   const [name, setName] = useState('OIChat User');
   const [pic, setPic] = useState('');
 
   useEffect(() => {
     InCallManager.startRingtone('_DEFAULT_');
 
-    for (let i of contacts) {
-      if (i.isRegistered && i.server_info.id === info.id) {
-        setName(i.item.name);
-        setPic(i.server_info.avatar);
-      }
+    const myIdStr = user?.data?.id?.toString?.();
+    const participantList = Array.isArray(info?.participants) ? info.participants : (info?.id ? [info.id] : []);
+    const otherIds = participantList
+      .map(x => x?.toString?.() ?? String(x))
+      .filter(id => id && id !== myIdStr);
+
+    const lookup = (idStr) => {
+      const c = contacts?.find?.(ct => ct?.isRegistered && ct?.server_info?.id?.toString?.() === idStr);
+      return {
+        name: c?.item?.name || `${c?.item?.firstName || ''} ${c?.item?.lastName || ''}`.trim() || idStr,
+        avatar: c?.server_info?.avatar || '',
+      };
+    };
+
+    if (otherIds.length > 1) {
+      // Group call: show all other participants so user knows who’s in the call
+      const names = otherIds.map(id => lookup(id).name).filter(Boolean);
+      const display = names.length <= 2 ? names.join(' & ') : `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
+      setName(display || 'Group Call');
+      setPic(''); // keep blank for now (optional: group avatar)
+    } else if (otherIds.length === 1) {
+      const { name, avatar } = lookup(otherIds[0]);
+      setName(name || 'OIChat User');
+      setPic(avatar || '');
     }
   }, []);
 
@@ -82,7 +102,18 @@ export const IncomingCall = () => {
             <TouchableOpacity><Avatar.Icon size={60} style={{ backgroundColor: 'white' }} icon={() => <MaterialCommunityIcons name="chat-outline" size={34} color="black" />} /></TouchableOpacity>
           </View>
           <View style={styles.options}>
-            <TouchableOpacity onPress={processAccept}><Avatar.Icon size={60} style={{ backgroundColor: 'rgb(99, 197, 93)' }} icon={() => <MaterialIcons name="call" size={30} color="white" />} /></TouchableOpacity>
+            <TouchableOpacity
+              onPress={async () => {
+                try {
+                  InCallManager.stopRingtone();
+                } catch (e) {
+                  // ignore
+                }
+                await processAccept({ source: 'ui' });
+              }}
+            >
+              <Avatar.Icon size={60} style={{ backgroundColor: 'rgb(99, 197, 93)' }} icon={() => <MaterialIcons name="call" size={30} color="white" />} />
+            </TouchableOpacity>
             <TouchableOpacity onPress={handleEndCall}><Avatar.Icon size={60} style={{ backgroundColor: 'rgb(208,56,81)' }} icon={() => <MaterialCommunityIcons name="phone-hangup" size={30} color="white" />} /></TouchableOpacity>
           </View>
         </View>
@@ -94,8 +125,9 @@ export const IncomingCall = () => {
 export const OutgoingCall = (props) => {
 
     let {type, video, mic, navigation} = props
-    let {localStream, info, setCall, setType, endCall, toggleVideo: toggleVideoRTC, toggleAudio: toggleAudioRTC, videoStatus, micStatus, sendTransport, recvTransport} = useRTC();
+    let {localStream, info, setCall, setType, endCall, toggleVideo: toggleVideoRTC, toggleAudio: toggleAudioRTC, videoStatus, micStatus, sendTransport, recvTransport, participantsList} = useRTC();
     let {contacts} = useSelector(state=>state.contacts.value);
+    let user = useSelector(state=>state.user.value);
     let [name,setName] = useState('');
     const [pic, setPic] = useState(''); // Profile picture of the person being called
     const [isSpeakerOn, setIsSpeakerOn] = useState(false); // Default to earpiece (false)
@@ -139,27 +171,43 @@ export const OutgoingCall = (props) => {
     }, [localStream, info]);
 
     useEffect(()=>{
+        const myIdStr = user?.data?.id?.toString?.();
+        const participantList = Array.isArray(info?.participants) ? info.participants : (info?.id ? [info.id] : []);
+        const otherIds = participantList
+            .map(x => x?.toString?.() ?? String(x))
+            .filter(id => id && id !== myIdStr);
 
-        for(let i of contacts){
-            if(i.isRegistered){
-                if(i.server_info.id==info.id){
-                    console.log(i,'sniper...\n\n')
-                    setName(i.item.name);
-                    setPic(i.server_info.avatar || ''); // Get profile picture
-                }
-            }
+        const lookupName = (idStr) => {
+            const c = contacts?.find?.(ct => ct?.isRegistered && ct?.server_info?.id?.toString?.() === idStr);
+            const first = c?.item?.firstName || '';
+            const last = c?.item?.lastName || '';
+            return `${first} ${last}`.trim() || c?.item?.name || idStr;
+        };
+        const lookupAvatar = (idStr) => {
+            const c = contacts?.find?.(ct => ct?.isRegistered && ct?.server_info?.id?.toString?.() === idStr);
+            return c?.server_info?.avatar || '';
+        };
+
+        if (otherIds.length > 1) {
+            const names = otherIds.map(lookupName).filter(Boolean);
+            const display = names.length <= 2 ? names.join(' & ') : `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
+            setName(display);
+            setPic('');
+        } else if (otherIds.length === 1) {
+            setName(lookupName(otherIds[0]));
+            setPic(lookupAvatar(otherIds[0]));
         }
 
-    },[info?.id, contacts])
+    },[info?.id, info?.participants, contacts, user?.data?.id])
 
     // Set default to earpiece (not speaker) when outgoing call starts
     useEffect(() => {
         if (info?.type) {
-            // Default to earpiece for outgoing calls
             try {
-                InCallManager.setForceSpeakerphoneOn(false);
+                // Force speaker ON for call audio (helps avoid "I have remote audio track but can't hear anything").
+                InCallManager.setForceSpeakerphoneOn(true);
                 setIsSpeakerOn(false);
-                console.log('🔇 Default set to earpiece for outgoing call');
+                console.log('🔊 Forced speaker ON for call audio');
             } catch (e) {
                 console.warn('⚠️ Error setting default speaker mode:', e);
             }
@@ -280,6 +328,8 @@ export const OutgoingCall = (props) => {
                                     fontWeight: 'bold',
                                     color: 'white',
                                     marginBottom: 8,
+                                    maxWidth: '85%',
+                                    textAlign: 'center',
                                 }}
                             >
                                 {name || 'OIChat User'}
@@ -341,6 +391,8 @@ export const OutgoingCall = (props) => {
                                     fontWeight: 'bold',
                                     color: 'white',
                                     marginBottom: 8,
+                                    maxWidth: '85%',
+                                    textAlign: 'center',
                                 }}
                             >
                                 {name || 'OIChat User'}
@@ -375,6 +427,8 @@ export const OutgoingCall = (props) => {
                             fontWeight: 'bold',
                             color: 'white',
                             marginBottom: 8,
+                            maxWidth: '85%',
+                            textAlign: 'center',
                         }}
                     >
                         {name || 'OIChat User'}
@@ -415,6 +469,8 @@ export const OutgoingCall = (props) => {
                     fontWeight: 'bold',
                     color: 'white',
                     letterSpacing: 1,
+                    maxWidth: '85%',
+                    textAlign: 'center',
                     }}
                 >
                     {name}

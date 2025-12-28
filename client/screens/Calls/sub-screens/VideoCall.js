@@ -1,5 +1,5 @@
 import React, {useState,useRef,useEffect, useCallback, useMemo} from 'react'
-import {View,Text, StyleSheet, ImageBackground, TouchableOpacity,Dimensions, Alert, SafeAreaView, Animated, PanResponder, ActivityIndicator, Platform, useColorScheme, TextInput, ScrollView, Image, Pressable} from 'react-native';
+import {View,Text, StyleSheet, ImageBackground, TouchableOpacity,Dimensions, Alert, SafeAreaView, Animated, PanResponder, ActivityIndicator, Platform, useColorScheme, TextInput, ScrollView, Image, Pressable, FlatList} from 'react-native';
 import Feather from '@expo/vector-icons/Feather';
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
@@ -29,6 +29,102 @@ const windowHeight = Dimensions.get('window').height;
 const barWidth = windowWidth*0.85;
 const topMargin = windowHeight*0.08;
 
+/* ================= PARTICIPANT VIEW COMPONENT ================= */
+const ParticipantView = ({ participant, style }) => {
+    const { userId, name, avatar, stream, muted, isLocal, streamKey } = participant;
+    const hasVideo = !!stream && stream.getVideoTracks().length > 0 && !muted.video;
+    const isRinging = !isLocal && !stream; // no stream yet => user hasn't joined
+
+    return (
+        <View style={[styles.participantContainer, style]}>
+            {hasVideo ? (
+                <RTCView
+                    key={`rtc-${userId}-${streamKey || 0}`}
+                    streamURL={stream.toURL()}
+                    objectFit="cover"
+                    style={StyleSheet.absoluteFill}
+                    mirror={isLocal}
+                />
+            ) : (
+                <View style={[StyleSheet.absoluteFill, styles.videoOffFallback]}>
+                    {avatar ? (
+                        <Avatar.Image size={60} source={{ uri: avatar }} />
+                    ) : (
+                        <Avatar.Text size={60} label={name?.charAt(0)?.toUpperCase() || '?'} />
+                    )}
+                    <Text style={styles.participantNameFallback} numberOfLines={1} ellipsizeMode="tail">
+                        {isLocal ? 'You' : (name || userId)}
+                    </Text>
+                    {!isLocal && (
+                        <Text style={styles.participantStatusText} numberOfLines={1} ellipsizeMode="tail">
+                            {isRinging ? 'Ringing…' : (muted.video ? 'Video off' : 'Connecting…')}
+                        </Text>
+                    )}
+                </View>
+            )}
+            
+            {/* Mute indicators overlay */}
+            <View style={styles.participantOverlay}>
+                {muted.mic && (
+                    <View style={styles.muteIndicator}>
+                        <Feather name="mic-off" size={16} color="white" />
+                    </View>
+                )}
+                {muted.video && (
+                    <View style={styles.muteIndicator}>
+                        <Feather name="video-off" size={16} color="white" />
+                    </View>
+                )}
+                <Text style={styles.participantNameOverlay} numberOfLines={1} ellipsizeMode="tail">
+                    {isLocal ? 'You' : (name || userId)}
+                </Text>
+            </View>
+        </View>
+    );
+};
+
+/* ================= GROUP CALL VIEW COMPONENT ================= */
+const GroupCallView = ({ participants, localStream }) => {
+    // Ensure local participant is first
+    const sortedParticipants = useMemo(() => {
+        const local = participants.find(p => p.isLocal);
+        const remote = participants.filter(p => !p.isLocal);
+        return local ? [local, ...remote] : participants;
+    }, [participants]);
+
+    const gridPadding = 12;
+    const gridGap = 10;
+    const tileWidth = (windowWidth - (gridPadding * 2) - gridGap) / 2;
+    const tileHeight = tileWidth * 1.35; // taller than wide
+
+    return (
+        <FlatList
+            data={sortedParticipants}
+            keyExtractor={(p) => p.userId?.toString?.() ?? String(p.userId)}
+            numColumns={2}
+            showsVerticalScrollIndicator={false}
+            style={{ flex: 1 }}
+            contentContainerStyle={{
+                padding: gridPadding,
+                paddingTop: gridPadding + 16,
+                paddingBottom: 220,
+                backgroundColor: '#0B0B0F', // same in light/dark
+            }}
+            columnWrapperStyle={{ justifyContent: 'space-between' }}
+            renderItem={({ item }) => (
+                <ParticipantView
+                    participant={item}
+                    style={{
+                        width: tileWidth,
+                        height: tileHeight,
+                        marginBottom: gridGap,
+                    }}
+                />
+            )}
+        />
+    );
+};
+
 const VideoCall = ({navigation}) => {
 
     const {
@@ -44,7 +140,10 @@ const VideoCall = ({navigation}) => {
         remoteMicMuted, // Remote user's producer mute status
         remoteVideoMuted, // Remote user's video producer mute status
         toggleMuteProducer, // Function to pause/resume audio producer
-        toggleVideoProducer // Function to pause/resume video producer
+        toggleVideoProducer, // Function to pause/resume video producer
+        participantsList, // Array of participants for group calls
+        callInfo, // Call information
+        addParticipantsToCall, // Function to add members to call
     } = useRTC();
     let [video, setVideo] = useState(info?.type=='video');
     let [mic, setMic] = useState(true);
@@ -131,8 +230,39 @@ const VideoCall = ({navigation}) => {
 
     useEffect(() => {
         // Track status changes
-        console.log('📊 [VideoCall] Status update:', { micStatus, remoteMicMuted, videoStatus });
-    }, [micStatus, videoStatus, remoteStream, remoteMicMuted]);
+        console.log('📊 [VideoCall] Status update:', { 
+            micStatus, 
+            remoteMicMuted, 
+            videoStatus,
+            hasRemoteStream: !!remoteStream,
+            remoteStreamId: remoteStream?.id,
+            remoteStreamTracksCount,
+            remoteVideoTracks: remoteStream?.getVideoTracks()?.length || 0,
+            remoteAudioTracks: remoteStream?.getAudioTracks()?.length || 0,
+            remoteVideoMuted,
+            remoteStreamURL: remoteStream && typeof remoteStream.toURL === 'function' ? remoteStream.toURL() : 'no toURL method'
+        });
+    }, [micStatus, videoStatus, remoteStream, remoteMicMuted, remoteStreamTracksCount, remoteVideoMuted]);
+
+    // Focused group-call debug logs (safe to keep during rollout)
+    useEffect(() => {
+        if (!participantsList || participantsList.length <= 2) return;
+        const snapshot = participantsList.map(p => ({
+            userId: p.userId,
+            name: p.name,
+            isLocal: p.isLocal,
+            hasStream: !!p.stream,
+            videoTracks: p.stream?.getVideoTracks?.()?.length || 0,
+            audioTracks: p.stream?.getAudioTracks?.()?.length || 0,
+            muted: p.muted,
+        }));
+        console.log('👥 [VideoCall] Group participants snapshot:', snapshot);
+        console.log('🎥 [VideoCall] localStream tracks:', {
+            hasLocalStream: !!localStream,
+            videoTracks: localStream?.getVideoTracks?.()?.length || 0,
+            audioTracks: localStream?.getAudioTracks?.()?.length || 0,
+        });
+    }, [participantsList, localStream]);
 
     useEffect(() => {
         probeAudioRoutes();
@@ -384,50 +514,22 @@ const VideoCall = ({navigation}) => {
         }
     };
 
-    // Function to add members to call - similar to NewCall.js handleCall
-    // Commented out for now, will be implemented later with rtc.js changes
+    // Function to add members to call
     const addToCall = async () => {
-        // Collect all IDs from addingMembers array (similar to selected in NewCall.js)
         const memberIds = addingMembers.map(member => member.id);
         
-        // TODO: Implement actual add to call logic with rtc.js
-        // This will likely involve:
-        // 1. API call to add members to the call
-        // 2. Update Mediasoup transports/producers/consumers
-        // 3. Notify other participants
-        
-        console.log('📱 Adding members to call:', memberIds);
-        console.log('📱 Member details:', addingMembers);
-        
-        // Example structure (commented out):
-        /*
-        try {
-            let reply = await fetch('http://216.126.78.3:8500/api/add_to_call', {
-                method: 'POST',
-                headers: {
-                    'Content-type': 'application/json',
-                    'Authorization': `Bearer ${user.token}`
-                },
-                body: JSON.stringify({
-                    callId: info?.callId, // Current call ID
-                    memberIds: memberIds // Array of user IDs to add
-                })
-            });
-            let response = await reply.json();
-            
-            if (response.success) {
-                // Handle successful addition
-                // Update RTC context, add transports, etc.
-                setAddingMembers([]); // Clear selection
-                setShowAddMembers(false);
-                bottomSheetModalRef.current?.snapToIndex(0);
-            } else {
-                console.log('Error adding members to call...\n\n');
-            }
-        } catch (err) {
-            console.log('Error adding members to call: ', err);
+        if (memberIds.length === 0) {
+            return;
         }
-        */
+
+        try {
+            await addParticipantsToCall(memberIds);
+            setAddingMembers([]); // Clear selection
+            bottomSheetModalRef.current?.dismiss();
+        } catch (error) {
+            console.error('❌ [VideoCall] Error adding members:', error);
+            Alert.alert('Error', 'Failed to add members to call');
+        }
     };
 
     const handleCopyLink = () => {
@@ -448,7 +550,7 @@ const VideoCall = ({navigation}) => {
         <SafeAreaView style={{ flex: 1, backgroundColor: 'black' }}>
 
             {/*Upper Actions - Hangup and Minimize */}
-            <View style={{...styles.pillTop, backgroundColor:'transparent'}}>
+            <View style={styles.pillTop}>
                 <TouchableOpacity onPress={handleMinimize}>
                     <Avatar.Icon
                         size={44}
@@ -470,22 +572,34 @@ const VideoCall = ({navigation}) => {
             {/*Upper Actions - Video/Audio Content*/}
             {info?.type === 'video' ? (
                 <>
-                    {/* ✅ Full Screen Video - Swaps between local and remote based on streamsSwapped state */}
-                    {!streamsSwapped ? (
+                    {/* Group call view (3+ participants) */}
+                    {participantsList && participantsList.length > 2 ? (
+                        <GroupCallView participants={participantsList} localStream={localStream} />
+                    ) : (
                         <>
-                            {/* Remote video full screen OR avatar fallback */}
-                            {!remoteVideoMuted && remoteStream && typeof remoteStream?.toURL === 'function' && (
-                                <RTCView
-                                    key={`remote-${remoteStream.id}-${remoteStreamTracksCount}`}
-                                    streamURL={remoteStream.toURL()}
-                                    objectFit="cover"
-                                    style={StyleSheet.absoluteFill}
-                                    zOrder={0}
-                                    mirror={false}
-                                />
-                            )}
-                            {/* Show fallback if remoteVideoMuted is true */}
-                            {remoteVideoMuted && (
+                            {/* ✅ Full Screen Video - Swaps between local and remote based on streamsSwapped state */}
+                            {!streamsSwapped ? (
+                        <>
+                            {/* Remote video full screen OR fallback */}
+                            {(() => {
+                                const hasRemoteVideoTrack = !!remoteStream && (remoteStream.getVideoTracks?.()?.length || 0) > 0;
+                                const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
+
+                                if (canRenderRemote) {
+                                    return (
+                                        <RTCView
+                                            key={`remote-${remoteStream.id}-${remoteStreamTracksCount}`}
+                                            streamURL={remoteStream.toURL()}
+                                            objectFit="cover"
+                                            style={StyleSheet.absoluteFill}
+                                            zOrder={0}
+                                            mirror={false}
+                                        />
+                                    );
+                                }
+
+                                const statusText = remoteVideoMuted ? 'Video is off' : 'Connecting…';
+                                return (
                                 <View style={[
                                     StyleSheet.absoluteFill, 
                                     { 
@@ -502,9 +616,10 @@ const VideoCall = ({navigation}) => {
                                             ? `${firstName} ${lastName}`
                                             : name}
                                     </Text>
-                                    <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 4, fontSize: 14 }}>Video is off</Text>
+                                    <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 4, fontSize: 14 }}>{statusText}</Text>
                                 </View>
-                            )}
+                                );
+                            })()}
                         </>
                     ) : (
                         <>
@@ -647,14 +762,22 @@ const VideoCall = ({navigation}) => {
                         ) : (
                             <>
                                 {/* Remote video small preview */}
-                                {!remoteVideoMuted && remoteStream && typeof remoteStream?.toURL === 'function' ? (
-                                    <RTCView
-                                        streamURL={remoteStream.toURL()}
-                                        objectFit="cover"
-                                        style={{ width: '100%', height: '100%' }}
-                                        mirror={false}
-                                    />
-                                ) : (
+                                {(() => {
+                                    const hasRemoteVideoTrack = !!remoteStream && (remoteStream.getVideoTracks?.()?.length || 0) > 0;
+                                    const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
+                                    if (canRenderRemote) {
+                                        return (
+                                            <RTCView
+                                                key={`remote-small-${remoteStream.id}-${remoteStreamTracksCount}`}
+                                                streamURL={remoteStream.toURL()}
+                                                objectFit="cover"
+                                                style={{ width: '100%', height: '100%' }}
+                                                mirror={false}
+                                            />
+                                        );
+                                    }
+                                    const statusText = remoteVideoMuted ? 'Video off' : 'Connecting…';
+                                    return (
                                     <View style={{
                                         ...StyleSheet.absoluteFillObject,
                                         backgroundColor: '#111',
@@ -667,26 +790,31 @@ const VideoCall = ({navigation}) => {
                                                 ? `${firstName} ${lastName}`
                                                 : name}
                                         </Text>
+                                        <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 2, fontSize: 11 }}>
+                                            {statusText}
+                                        </Text>
                     </View>
-                    )}
+                                    );
+                                })()}
                             </>
                         )}
                     </TouchableOpacity>
-
+                        </>
+                    )}
                 </>
-                ) : (
-                    <>
-                        {/* Audio call fallback */}
-                        <View style={{ ...StyleSheet.absoluteFill, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgb(46,49,61)' }}>
-                            <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
-                            <Text style={{ fontSize: 22, fontWeight: 'bold', color: 'white', marginTop: 20 }}>{name}</Text>
-                            <Text style={{ fontSize: 16, color: 'white', marginTop: 10 }}>Audio Call</Text>
-                        </View>
-                    </>
+            ) : (
+                <>
+                    {/* Audio call fallback */}
+                    <View style={{ ...StyleSheet.absoluteFill, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgb(46,49,61)' }}>
+                        <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
+                        <Text style={{ fontSize: 22, fontWeight: 'bold', color: 'white', marginTop: 20 }}>{name}</Text>
+                        <Text style={{ fontSize: 16, color: 'white', marginTop: 10 }}>Audio Call</Text>
+                    </View>
+                </>
             )}
 
             {/* Call Controls */}
-            <View style={{ justifyContent: 'flex-end', paddingBottom: insets.bottom, flex: 1 }}>
+            <View style={[styles.controlsWrapper, { paddingBottom: insets.bottom + 10 }]}>
                 {/* Flip Camera Button - Above Call Controls */}
                 {info?.type === 'video' && (
                     <View style={{ alignSelf: 'flex-end', marginRight: (windowWidth - windowWidth * 0.85) / 2, marginBottom: 15 }}>
@@ -1026,21 +1154,23 @@ const styles = StyleSheet.create({
 
     },
     pillTop: {
-        width: '85%',
+        width: '92%',
         borderRadius: 30,
-        paddingHorizontal: 10,
+        paddingHorizontal: 12,
+        paddingVertical: 6,
         flexDirection: 'row',
         justifyContent: 'space-between',
-        backgroundColor: 'rgba(255,255,255,0.3)',
+        backgroundColor: 'transparent',
         alignSelf: 'center',
         elevation: 4,
         zIndex: 4,
         marginTop: 10,
+        marginBottom: 14,
     },
     pillBottom: {
         width: '85%',
         borderRadius: 30,
-        paddingHorizontal: 10,
+        paddingHorizontal: 14,
         paddingVertical: 20,
         flexDirection: 'row',
         justifyContent: 'space-between',
@@ -1048,6 +1178,14 @@ const styles = StyleSheet.create({
         alignSelf: 'center',
         elevation: 4,
         zIndex: 4,
+    },
+    controlsWrapper: {
+        position: 'absolute',
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 6,
+        alignItems: 'center',
     },
     video:{
         position:'absolute',
@@ -1086,6 +1224,51 @@ const styles = StyleSheet.create({
         alignItems: 'center',
         paddingVertical: 10,
         paddingHorizontal: 10,
+    },
+    participantContainer: {
+        borderRadius: 12,
+        overflow: 'hidden',
+        backgroundColor: '#0B0B0F',
+    },
+    videoOffFallback: {
+        justifyContent: 'center',
+        alignItems: 'center',
+        backgroundColor: '#0B0B0F',
+    },
+    participantNameFallback: {
+        marginTop: 10,
+        fontSize: 14,
+        fontWeight: '700',
+        color: 'white',
+        maxWidth: '90%',
+        textAlign: 'center',
+    },
+    participantStatusText: {
+        marginTop: 6,
+        fontSize: 12,
+        fontWeight: '600',
+        color: 'rgba(255,255,255,0.75)',
+        maxWidth: '90%',
+        textAlign: 'center',
+    },
+    participantOverlay: {
+        position: 'absolute',
+        bottom: 0,
+        left: 0,
+        right: 0,
+        backgroundColor: 'rgba(0,0,0,0.6)',
+        padding: 8,
+        flexDirection: 'row',
+        alignItems: 'center',
+    },
+    muteIndicator: {
+        marginRight: 6,
+    },
+    participantNameOverlay: {
+        color: 'white',
+        fontSize: 12,
+        fontWeight: '600',
+        flex: 1,
     },
 })
 

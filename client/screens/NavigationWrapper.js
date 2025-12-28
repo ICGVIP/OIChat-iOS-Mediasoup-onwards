@@ -83,6 +83,7 @@ const AuthContainer = () => {
   let {socket, setChats,ask, setHiddenChats, setArchivedChats} = useChannelSet();
   let user = useSelector(state=>state.user.value);
   let {setType, type, processAccept, endCall, waitForIncomingCallSetup, socket: rtcSocket} = useRTC()
+  const callkeepAnswerHandledRef = useRef(false);
 
   useEffect(()=>{
     (
@@ -116,6 +117,12 @@ const AuthContainer = () => {
   useEffect(() => {
     const onAnswer = async () => {
       try {
+      if (callkeepAnswerHandledRef.current) {
+        console.log('[NAV] Ignoring duplicate CallKeep answerCall event');
+        return;
+      }
+      callkeepAnswerHandledRef.current = true;
+
       const callDataStr = await AsyncStorage.getItem('incomingCallData');
         if (!callDataStr) return endCall();
       
@@ -127,12 +134,17 @@ const AuthContainer = () => {
         }
 
         await waitForIncomingCallSetup();
-        await processAccept();
+        await processAccept({ source: 'callkeep' });
         
           navigate('Video Call');
       } catch (err) {
         console.error('[NAV] Accept failed:', err);
         endCall();
+      } finally {
+        // Allow future calls to be answered
+        setTimeout(() => {
+          callkeepAnswerHandledRef.current = false;
+        }, 2000);
       }
     };
 

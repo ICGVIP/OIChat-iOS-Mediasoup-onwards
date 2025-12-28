@@ -1,5 +1,4 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { EventTarget } from 'event-target-shim';
 import { AppRegistry, Platform } from 'react-native';
 import RNCallKeep from 'react-native-callkeep';
 import 'react-native-gesture-handler';

@@ -1,0 +1,49 @@
+{
+    "$schema": "https://typedoc.org/schema.json",
+    "name": "MediaSFU React Native (Expo)",
+    "entryPoints": ["docs.tsx"],
+    "entryPointStrategy": "expand",
+    "groupOrder": [ "Components", "Hooks", "Types", "Utils" ],
+    "kindSortOrder": ["Class","Function", "Interface", "TypeAlias", "Variable"],
+    "packageOptions": {
+      "entryPoints": ["docs.tsx"],
+      "groupOrder": [ "Components", "Hooks", "Types", "Utils" ],
+      "kindSortOrder": ["Function", "Interface", "TypeAlias"],
+      "readme": "none"
+    },
+    "out": "docs",
+    "sidebarLinks": {
+      "MediaSFU": "https://mediasfu.com",
+    },
+    "highlightLanguages": [
+        "bash",
+        "console",
+        "css",
+        "html",
+        "javascript",
+        "json",
+        "jsonc",
+        "json5",
+        "tsx",
+        "typescript",
+      "jsx"
+    ],
+    "theme": "default",
+    "plugin": ["typedoc-plugin-extras"],
+    "logLevel": "Error",
+    "hostedBaseUrl": "https://mediasfu.com/reactnativeexpo",
+    "useHostedBaseUrlForAbsoluteLinks": false,
+    "customFooterHtml": "&copy; 2024 <strong>MediaSFU</strong>",
+    "navigation": {
+        "includeCategories": true,
+        "includeGroups": true,
+        "includeFolders": true
+    },
+    "categorizeByGroup": true,
+    "hideGenerator":true,
+    "sort": ["source-order", "kind", "alphabetical"],
+    "customTitle": "MediaSFU React Native (Expo)",
+    "customDescription" : "MediaSFU React Native (Expo) SDK",
+    "favicon": "./favicon.ico"
+  }
+  

@@ -46,8 +46,11 @@ const io = new Server(server, {
 
 const mediasoupConfig = {
   worker: {
-    rtcMinPort: 40000,
-    rtcMaxPort: 40003,
+    // IMPORTANT:
+    // These ports MUST be open on your server's firewall/security group (UDP + TCP).
+    // Group calls create multiple WebRtcTransports, so keep this range comfortably large.
+    rtcMinPort: Number(process.env.MEDIASOUP_RTC_MIN_PORT || 40000),
+    rtcMaxPort: Number(process.env.MEDIASOUP_RTC_MAX_PORT || 40100),
     logLevel: 'warn',
     logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp'],
   },
@@ -101,11 +104,16 @@ async function createRouter() {
 }
 
 async function createWebRtcTransport(router) {
+  const announcedIp =
+    process.env.MEDIASOUP_ANNOUNCED_IP ||
+    process.env.ANNOUNCED_IP ||
+    '216.126.78.3';
+
   const transport = await router.createWebRtcTransport({
     listenIps: [
       {
         ip: '0.0.0.0',
-        announcedIp: '216.126.78.3',
+        announcedIp,
       },
     ],
     enableUdp: true,
@@ -137,30 +145,56 @@ io.on('connection', socket => {
     // When user reconnects after VoIP push, resend the incoming-call event
     // BUT only if they haven't already received it and aren't already in the call
     for (const [callId, callData] of activeCalls.entries()) {
-      if (callData.voipPushSent && callData.calleeUserId === userId) {
-        const calleePeer = callData.peers.get(userId);
-        // Only resend if:
-        // 1. User is not already in peers (hasn't accepted yet)
-        // 2. Transports still exist (call hasn't been accepted)
-        // 3. Incoming call hasn't been sent via socket yet (only VoIP push was sent)
-        if (!calleePeer && callData.calleeTransports && !callData.incomingCallSent) {
+      const calleePeer = callData.peers.get(userId);
+      const callerId = callData.creatorId ?? Array.from(callData.peers.keys())[0];
+      const allParticipants = Array.isArray(callData.participantIds)
+        ? [callerId, ...callData.participantIds]
+        : [callerId];
+
+      // Per-user idempotency (prevents resend storms)
+      if (!callData.incomingCallSentMap) {
+        callData.incomingCallSentMap = new Map();
+      }
+      if (callData.incomingCallSentMap.get(userId)) {
+        continue;
+      }
+
+      // 1:1 legacy (older push flow flags)
+      const legacyShouldResend =
+        callData.voipPushSent &&
+        callData.calleeUserId === userId &&
+        !!callData.calleeTransports;
+
+      // Group-call offline push flow (new)
+      const groupShouldResend =
+        callData.voipPushes?.has?.(userId) &&
+        !!callData.pendingTransports?.has?.(userId);
+
+      if (!calleePeer && (legacyShouldResend || groupShouldResend)) {
+        let sendTransportParams = null;
+        let recvTransportParams = null;
+
+        if (callData.calleeTransports) {
+          sendTransportParams = callData.calleeTransports.sendTransportParams;
+          recvTransportParams = callData.calleeTransports.recvTransportParams;
+        } else if (callData.pendingTransports && callData.pendingTransports.has(userId)) {
+          const pending = callData.pendingTransports.get(userId);
+          sendTransportParams = pending.sendTransportParams;
+          recvTransportParams = pending.recvTransportParams;
+        }
+
+        if (sendTransportParams && recvTransportParams) {
           socket.emit('incoming-call', {
             callId,
-            fromUserId: Array.from(callData.peers.keys())[0], // Get caller ID
+            fromUserId: callerId,
             callType: callData.callType || 'video',
             rtpCapabilities: callData.router.rtpCapabilities,
-            sendTransport: callData.calleeTransports.sendTransportParams,
-            recvTransport: callData.calleeTransports.recvTransportParams,
+            sendTransport: sendTransportParams,
+            recvTransport: recvTransportParams,
+            participants: allParticipants,
           });
-          // Mark that incoming-call was sent via socket (prevents duplicate sends on reconnect)
-          callData.incomingCallSent = true;
+          callData.incomingCallSentMap.set(userId, true);
           console.log('📤 [SERVER] Resent incoming-call event to reconnected user', userId, 'for call', callId);
-        } else if (calleePeer) {
-          console.log('ℹ️ [SERVER] User', userId, 'already in call', callId, '- skipping incoming-call resend');
-        } else if (!callData.calleeTransports) {
-          console.log('ℹ️ [SERVER] Call', callId, 'already accepted - skipping incoming-call resend');
-        } else if (callData.incomingCallSent) {
-          console.log('ℹ️ [SERVER] Incoming-call already sent to user', userId, 'for call', callId, '- skipping duplicate');
         }
       }
     }
@@ -207,12 +241,36 @@ io.on('connection', socket => {
   });
 
   /* ---------- START CALL ---------- */
-  socket.on('start-call', async ({ toUserId, callType }, cb) => {
+  socket.on('start-call', async ({ toUserIds, toUserId, callType }, cb) => {
     try {
-      console.log('📞 [SERVER] Call request received from user', socket.userId, 'to', toUserId, 'type:', callType);
+      console.log('📞 [SERVER] start-call event received', {
+        fromUserId: socket.userId,
+        toUserIds,
+        toUserId,
+        callType,
+        hasCallback: typeof cb === 'function'
+      });
+
+      // Normalize to array (backward compatible)
+      const participantIds = Array.isArray(toUserIds) ? toUserIds : (toUserId ? [toUserId] : []);
+      console.log('📞 [SERVER] Normalized participant IDs:', participantIds);
+      
+      if (participantIds.length === 0) {
+        console.error('❌ [SERVER] No participants specified');
+        return cb({ error: 'No participants specified' });
+      }
+
+      console.log('📞 [SERVER] Call request received from user', socket.userId, 'to', participantIds, 'type:', callType);
       const callId = crypto.randomUUID();
       const router = await createRouter();
-      const callData = { router, peers: new Map(), callType };
+      const callData = {
+        router,
+        peers: new Map(),
+        callType,
+        creatorId: socket.userId,
+        participantIds, // targets (excluding caller)
+        incomingCallSentMap: new Map(),
+      };
       activeCalls.set(callId, callData);
 
       // Create transports for caller
@@ -227,18 +285,41 @@ io.on('connection', socket => {
         consumers: new Map(),
       });
 
-      // Create transports for callee (pre-create for faster connection)
-      const calleeSend = await createWebRtcTransport(router);
-      const calleeRecv = await createWebRtcTransport(router);
-      console.log('✅ [SERVER] Callee transports pre-created - Send:', calleeSend.transport.id, 'Recv:', calleeRecv.transport.id);
+      // For 1:1 calls, pre-create callee transports (for faster connection)
+      // For group calls, create transports when each participant accepts
+      if (participantIds.length === 1) {
+        const calleeSend = await createWebRtcTransport(router);
+        const calleeRecv = await createWebRtcTransport(router);
+        console.log('✅ [SERVER] Callee transports pre-created - Send:', calleeSend.transport.id, 'Recv:', calleeRecv.transport.id);
 
-      // Store callee transports (will be assigned when callee accepts)
-      callData.calleeTransports = {
-        sendTransport: calleeSend.transport,
-        recvTransport: calleeRecv.transport,
-        sendTransportParams: calleeSend.params,
-        recvTransportParams: calleeRecv.params,
-      };
+        // Store callee transports (will be assigned when callee accepts)
+        callData.calleeTransports = {
+          sendTransport: calleeSend.transport,
+          recvTransport: calleeRecv.transport,
+          sendTransportParams: calleeSend.params,
+          recvTransportParams: calleeRecv.params,
+        };
+      } else {
+          // Group call - create transports for each participant
+          callData.pendingTransports = new Map();
+          for (const toUserId of participantIds) {
+            const calleeSend = await createWebRtcTransport(router);
+            const calleeRecv = await createWebRtcTransport(router);
+            callData.pendingTransports.set(toUserId, {
+              sendTransport: calleeSend.transport,
+              recvTransport: calleeRecv.transport,
+              sendTransportParams: calleeSend.params,
+              recvTransportParams: calleeRecv.params,
+            });
+          }
+      }
+
+      console.log('✅ [SERVER] Sending call setup data to caller', {
+        callId,
+        hasRtpCapabilities: !!router.rtpCapabilities,
+        hasSendTransport: !!callerSend.params,
+        hasRecvTransport: !!callerRecv.params,
+      });
 
       cb({
         callId,
@@ -247,22 +328,66 @@ io.on('connection', socket => {
         rtpCapabilities: router.rtpCapabilities,
       });
 
-      const calleeSocket = userSockets.get(toUserId);
-      if (calleeSocket) {
-        // Callee is online - send via socket
-        io.to(calleeSocket).emit('incoming-call', {
-          callId,
-          fromUserId: socket.userId,
-          callType,
-          rtpCapabilities: router.rtpCapabilities,
-          sendTransport: calleeSend.params,
-          recvTransport: calleeRecv.params,
+      console.log('✅ [SERVER] Callback sent to caller');
+
+      // Send incoming-call to all participants
+      for (const toUserId of participantIds) {
+        console.log('📤 [SERVER] Processing participant', toUserId);
+        const calleeSocket = userSockets.get(toUserId);
+        console.log('📤 [SERVER] Callee socket lookup', { 
+          toUserId, 
+          hasSocket: !!calleeSocket,
+          socketId: calleeSocket 
         });
-        // Mark that incoming-call was sent via socket (prevents duplicate on reconnect)
-        callData.incomingCallSent = true;
-        console.log('📤 [SERVER] Incoming call sent to callee via socket', toUserId);
+        
+        if (calleeSocket) {
+          // Participant is online - send via socket
+          if (participantIds.length === 1) {
+            // 1:1 call - use pre-created transports
+            console.log('📤 [SERVER] Sending 1:1 incoming-call to', toUserId, 'via socket', calleeSocket);
+            const incomingCallData = {
+              callId,
+              fromUserId: socket.userId,
+              callType,
+              rtpCapabilities: router.rtpCapabilities,
+              sendTransport: callData.calleeTransports.sendTransportParams,
+              recvTransport: callData.calleeTransports.recvTransportParams,
+              participants: [socket.userId, ...participantIds],
+            };
+            console.log('📤 [SERVER] Incoming call data:', {
+              callId,
+              fromUserId: socket.userId,
+              callType,
+              hasRtpCapabilities: !!router.rtpCapabilities,
+              hasSendTransport: !!callData.calleeTransports.sendTransportParams,
+              hasRecvTransport: !!callData.calleeTransports.recvTransportParams,
+            });
+            io.to(calleeSocket).emit('incoming-call', incomingCallData);
+            callData.incomingCallSentMap.set(toUserId, true);
+            console.log('✅ [SERVER] Incoming call event emitted to socket', calleeSocket);
+          } else {
+            // Group call - use pre-created transports for this participant
+            const transports = callData.pendingTransports.get(toUserId);
+            if (transports) {
+              console.log('📤 [SERVER] Sending group incoming-call to', toUserId);
+              io.to(calleeSocket).emit('incoming-call', {
+                callId,
+                fromUserId: socket.userId,
+                callType,
+                rtpCapabilities: router.rtpCapabilities,
+                sendTransport: transports.sendTransportParams,
+                recvTransport: transports.recvTransportParams,
+                participants: [socket.userId, ...participantIds],
+              });
+              callData.incomingCallSentMap.set(toUserId, true);
+            } else {
+              console.error('❌ [SERVER] No transports found for participant', toUserId);
+            }
+          }
+          console.log('✅ [SERVER] Incoming call sent to participant via socket', toUserId);
       } else {
-        // Callee is offline - send VoIP push notification (if database is available)
+          console.log('⚠️ [SERVER] Participant', toUserId, 'is offline (no socket found)');
+          // Participant is offline - send VoIP push notification (if database is available)
         if (User && sendVoipNotification) {
           try {
             const caller = await User.findByPk(socket.userId, { raw: true });
@@ -274,9 +399,13 @@ io.on('connection', socket => {
               const voipUUID = crypto.randomUUID();
               
               // Store call data for when client reconnects
-              callData.voipPushSent = true;
-              callData.voipUUID = voipUUID;
-              callData.calleeUserId = toUserId;
+                if (!callData.voipPushes) {
+                  callData.voipPushes = new Map();
+                }
+                callData.voipPushes.set(toUserId, {
+                  voipUUID,
+                  sent: true,
+                });
               
               // Send VoIP push notification
               sendVoipNotification(callee.voip_token, {
@@ -287,16 +416,18 @@ io.on('connection', socket => {
                 callerName,
                 handle: caller?.firstName || caller?.phone || socket.userId.toString(),
                 hasVideo: callType === 'video',
+                participants: [socket.userId, ...participantIds],
               });
-              console.log('📱 [SERVER] VoIP push notification sent to callee', toUserId, 'UUID:', voipUUID);
+                console.log('📱 [SERVER] VoIP push notification sent to participant', toUserId, 'UUID:', voipUUID);
             } else {
-              console.log('⚠️ [SERVER] Callee not found or no VoIP token', toUserId);
+                console.log('⚠️ [SERVER] Participant not found or no VoIP token', toUserId);
             }
           } catch (error) {
             console.error('❌ [SERVER] Error sending VoIP push notification:', error);
           }
         } else {
           console.log('⚠️ [SERVER] Database not available - cannot send VoIP push notification to offline user', toUserId);
+          }
         }
       }
     } catch (e) {
@@ -310,41 +441,88 @@ io.on('connection', socket => {
       const callData = activeCalls.get(callId);
       if (!callData) return cb({ error: 'Call not found' });
 
-      // Use pre-created transports for callee
-      if (!callData.calleeTransports) {
-        return cb({ error: 'Callee transports not found' });
+      let transports = null;
+
+      // Check if user already has transports (for participants added to existing call)
+      const existingPeer = callData.peers.get(socket.userId);
+      if (existingPeer) {
+        // User already has transports (added via add-participants)
+        transports = {
+          sendTransport: existingPeer.sendTransport,
+          recvTransport: existingPeer.recvTransport,
+        };
+        console.log('✅ [SERVER] Using existing transports for participant', socket.userId);
+      } else if (callData.calleeTransports) {
+        // 1:1 call - use pre-created transports
+        transports = callData.calleeTransports;
+        delete callData.calleeTransports;
+        console.log('✅ [SERVER] Using callee transports for 1:1 call');
+      } else if (callData.pendingTransports && callData.pendingTransports.has(socket.userId)) {
+        // Group call - get transports for this participant
+        const pending = callData.pendingTransports.get(socket.userId);
+        transports = {
+          sendTransport: pending.sendTransport,
+          recvTransport: pending.recvTransport,
+        };
+        callData.pendingTransports.delete(socket.userId);
+        console.log('✅ [SERVER] Using pending transports for group call');
+      } else {
+        console.error('❌ [SERVER] No transports found for participant', socket.userId);
+        return cb({ error: 'Transports not found for participant' });
       }
 
+      // Only create peer if it doesn't exist (for participants added via add-participants, it already exists)
+      if (!existingPeer) {
       callData.peers.set(socket.userId, {
-        sendTransport: callData.calleeTransports.sendTransport,
-        recvTransport: callData.calleeTransports.recvTransport,
+          sendTransport: transports.sendTransport,
+          recvTransport: transports.recvTransport,
         producers: new Map(),
         consumers: new Map(),
       });
-
-      // Clean up temporary storage
-      delete callData.calleeTransports;
+        console.log('✅ [SERVER] Created new peer entry for', socket.userId);
+      } else {
+        console.log('✅ [SERVER] Using existing peer entry for', socket.userId);
+      }
 
       cb({
         rtpCapabilities: callData.router.rtpCapabilities,
       });
 
-      const callerPeer = callData.peers.get(fromUserId);
-      if (callerPeer && callerPeer.producers.size > 0) {
-        const calleeSocketId = userSockets.get(socket.userId);
-        if (calleeSocketId) {
-          callerPeer.producers.forEach((producer, producerId) => {
-            io.to(calleeSocketId).emit('new-producer', { 
-              producerId,
-              kind: producer.kind 
+      // Notify all existing participants about new participant joining
+      for (const [uid] of callData.peers) {
+        if (uid !== socket.userId) {
+          const sid = userSockets.get(uid);
+          if (sid) {
+            io.to(sid).emit('participant-joined', {
+              callId,
+              userId: socket.userId,
             });
-          });
+          }
         }
       }
 
+      // Send existing producers to new participant
+      for (const [uid, peer] of callData.peers) {
+        if (uid !== socket.userId && peer.producers.size > 0) {
+        const calleeSocketId = userSockets.get(socket.userId);
+        if (calleeSocketId) {
+            peer.producers.forEach((producer, producerId) => {
+            io.to(calleeSocketId).emit('new-producer', { 
+              producerId,
+                kind: producer.kind,
+                userId: uid, // ✅ Add userId to new-producer event
+              });
+            });
+          }
+        }
+      }
+
+      // For 1:1 calls, notify caller
+      if (callData.peers.size === 2) {
       const callerSocket = userSockets.get(fromUserId);
       if (callerSocket) {
         io.to(callerSocket).emit('call-accepted', { callId });
+        }
       }
     } catch (e) {
       cb({ error: e.message });
@@ -402,14 +580,17 @@ io.on('connection', socket => {
 
       // Listen to producer pause/resume events (for mute functionality)
 
+      // Send new producer to all other participants in the call
       for (const [uid] of callData.peers) {
         if (uid !== socket.userId) {
           const sid = userSockets.get(uid);
           if (sid) {
             io.to(sid).emit('new-producer', { 
               producerId: producer.id,
-              kind: producer.kind 
+              kind: producer.kind,
+              userId: socket.userId, // ✅ Add userId to new-producer event
             });
+            console.log('📤 [SERVER] Sent new-producer to participant', uid, 'from', socket.userId, 'kind:', producer.kind);
           }
         }
       }
@@ -501,6 +682,107 @@ io.on('connection', socket => {
     }
   });
 
+  /* ---------- ADD PARTICIPANTS ---------- */
+  socket.on('add-participants', async ({ callId, participantIds }, cb) => {
+    try {
+      const callData = activeCalls.get(callId);
+      if (!callData) {
+        return cb({ error: 'Call not found' });
+      }
+
+      // Check if user is in the call
+      if (!callData.peers.has(socket.userId)) {
+        return cb({ error: 'User not in call' });
+      }
+
+      const addedParticipants = [];
+      
+      for (const userId of participantIds) {
+        // Skip if already in call
+        if (callData.peers.has(userId)) {
+          continue;
+        }
+
+        // Check max participants (10)
+        if (callData.peers.size >= 10) {
+          console.log('⚠️ [SERVER] Max participants (10) reached for call', callId);
+          break;
+        }
+
+        // Create transports for new participant
+        const sendTransport = await createWebRtcTransport(callData.router);
+        const recvTransport = await createWebRtcTransport(callData.router);
+
+        // Add to peers
+        callData.peers.set(userId, {
+          sendTransport: sendTransport.transport,
+          recvTransport: recvTransport.transport,
+          producers: new Map(),
+          consumers: new Map(),
+        });
+
+        // Send invitation to new participant
+        const participantSocket = userSockets.get(userId);
+        if (participantSocket) {
+          io.to(participantSocket).emit('call-invitation', {
+            callId,
+            fromUserId: socket.userId,
+            callType: callData.callType,
+            rtpCapabilities: callData.router.rtpCapabilities,
+            sendTransport: sendTransport.params,
+            recvTransport: recvTransport.params,
+          });
+          console.log('📤 [SERVER] Call invitation sent to participant', userId);
+        }
+
+        addedParticipants.push(userId);
+      }
+
+      // Notify existing participants about new participants
+      for (const [uid] of callData.peers) {
+        if (uid !== socket.userId && !addedParticipants.includes(uid)) {
+          const sid = userSockets.get(uid);
+          if (sid) {
+            io.to(sid).emit('participant-joined', {
+              callId,
+              userId: addedParticipants, // Array of new user IDs
+            });
+          }
+        }
+      }
+
+      // Send existing producers to new participants (after they accept)
+      // This will be handled when they accept the call-invitation
+      
+      // Send new participants' producers to existing participants
+      for (const addedUserId of addedParticipants) {
+        const addedPeer = callData.peers.get(addedUserId);
+        if (addedPeer && addedPeer.producers.size > 0) {
+          // Notify all existing participants about new participant's producers
+          for (const [uid] of callData.peers) {
+            if (uid !== addedUserId && uid !== socket.userId) {
+              const sid = userSockets.get(uid);
+              if (sid) {
+                addedPeer.producers.forEach((producer, producerId) => {
+                  io.to(sid).emit('new-producer', {
+                    producerId,
+                    kind: producer.kind,
+                    userId: addedUserId,
+                  });
+                  console.log('📤 [SERVER] Sent new-producer to existing participant', uid, 'for new participant', addedUserId);
+                });
+              }
+            }
+          }
+        }
+      }
+
+      cb({ success: true, addedParticipants });
+    } catch (e) {
+      cb({ error: e.message });
+    }
+  });
+
   /* ---------- END CALL ---------- */
   socket.on('end-call', ({ callId }) => {
     const callData = activeCalls.get(callId);
@@ -521,6 +803,19 @@ io.on('connection', socket => {
     // Mark as closing to prevent concurrent cleanup
     callData.closing = true;
     console.log('📴 [SERVER] Ending call', callId, 'initiated by user', socket.userId);
+
+    // Notify other participants that this user left
+    for (const [uid] of callData.peers) {
+      if (uid !== socket.userId) {
+        const sid = userSockets.get(uid);
+        if (sid) {
+          io.to(sid).emit('participant-left', {
+            callId,
+            userId: socket.userId,
+          });
+        }
+      }
+    }
 
     // Collect all user IDs to notify (including callee if transports were pre-created)
     const usersToNotify = new Set();
