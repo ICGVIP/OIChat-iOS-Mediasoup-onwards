@@ -7,6 +7,20 @@ export class StreamManager {
   constructor() {
     this.participantStreams = new Map(); // Map<userId, MediaStream>
     this.consumerToParticipant = new Map(); // Map<producerId, userId>
+
+    // Debug toggle: global.__RTC_DEBUG__ = true/false
+    this._dbgEnabled = () =>
+      (typeof global !== 'undefined' && global.__RTC_DEBUG__ !== undefined)
+        ? !!global.__RTC_DEBUG__
+        : (typeof __DEV__ !== 'undefined' ? __DEV__ : false);
+    this._dbg = (event, data = {}) => {
+      if (!this._dbgEnabled()) return;
+      try {
+        console.log(`[StreamManager] ${event}`, data);
+      } catch {
+        // ignore
+      }
+    };
   }
 
   /**
@@ -22,6 +36,7 @@ export class StreamManager {
       const { MediaStream } = require('react-native-webrtc');
       stream = new MediaStream();
       this.participantStreams.set(userIdStr, stream);
+      this._dbg('stream.created', { userId: userIdStr });
     }
     
     return stream;
@@ -62,6 +77,12 @@ export class StreamManager {
     // Create a NEW stream instance to force RTCView to refresh.
     const nextStream = new MediaStream(nextTracks);
     this.participantStreams.set(userIdStr, nextStream);
+    this._dbg('track.added', {
+      userId: userIdStr,
+      kind: track?.kind,
+      newAudioTracks: nextStream?.getAudioTracks?.()?.length || 0,
+      newVideoTracks: nextStream?.getVideoTracks?.()?.length || 0,
+    });
     return nextStream;
   }
 

@@ -20,6 +20,22 @@ import { StreamManager } from './streamManager';
 const RTCContext = createContext(null);
 export const useRTC = () => useContext(RTCContext);
 
+// ---- Debug logging (gated) ----
+// Toggle at runtime (dev) with: global.__RTC_DEBUG__ = true/false
+const RTC_DEBUG_DEFAULT = typeof __DEV__ !== 'undefined' ? __DEV__ : false;
+const rtcDbgEnabled = () =>
+  (typeof global !== 'undefined' && global.__RTC_DEBUG__ !== undefined)
+    ? !!global.__RTC_DEBUG__
+    : RTC_DEBUG_DEFAULT;
+const rtcDbg = (event, data = {}) => {
+  if (!rtcDbgEnabled()) return;
+  try {
+    console.log(`[RTC] ${event}`, data);
+  } catch {
+    // ignore
+  }
+};
+
 export const RTCProvider = ({ children }) => {
 
   const user = useSelector(state => state.user.value);
@@ -109,11 +125,9 @@ export const RTCProvider = ({ children }) => {
     });
 
     socket.current.on('connect', async () => {
-      
-      
+      rtcDbg('socket.connect', { socketId: socket.current?.id, userId: user?.data?.id });
       socket.current.emit('register', user.data.id);
-      
-      
+      rtcDbg('socket.register.emit', { userId: user?.data?.id });
       // Check AsyncStorage for pending call (app-killed scenario)
       // This ensures info.callId is available immediately, even before 'incoming-call' event fires
       try {
@@ -148,20 +162,35 @@ export const RTCProvider = ({ children }) => {
       }
     });
 
+    socket.current.on('disconnect', (reason) => {
+      rtcDbg('socket.disconnect', { socketId: socket.current?.id, reason });
+    });
+
+    socket.current.on('connect_error', (err) => {
+      rtcDbg('socket.connect_error', { message: err?.message || String(err) });
+    });
+
     /* ---------- INCOMING CALL ---------- */
     socket.current.on('incoming-call', async (data) => {
       const { callId, fromUserId, callType, rtpCapabilities, sendTransport, recvTransport, participants } = data;
 
-      
+      rtcDbg('incoming-call', {
+        callId,
+        fromUserId,
+        callType,
+        participantsCount: Array.isArray(participants) ? participants.length : undefined,
+        hasRtpCaps: !!rtpCapabilities,
+        hasSendTransport: !!sendTransport,
+        hasRecvTransport: !!recvTransport,
+      });
 
       // IDEMPOTENCY CHECK: If we already set up for this callId, skip duplicate setup
       // This prevents errors when server resends 'incoming-call' on reconnect
       if (incomingCallSetupCallId.current === callId && 
-          device.current && 
-          sendTransport.current && 
-          recvTransport.current && 
-          localStream) {
-        
+      device.current && 
+      sendTransport.current && 
+      recvTransport.current && 
+      localStream) {
         
         // Still update info state and signal completion (in case promise is waiting)
         setInfo({ id: fromUserId, callId, type: callType, name: fromUserId.toString(), participants });
@@ -636,11 +665,12 @@ export const RTCProvider = ({ children }) => {
 
   const createSendTransport = async (params) => {
     sendTransport.current = device.current.createSendTransport({...params, iceServers});
+    rtcDbg('sendTransport.created', { transportId: params?.id, callId: currentCallId.current });
 
     sendTransport.current.on('connect', ({ dtlsParameters }, cb, eb) => {
       try {
         const payload = { callId: currentCallId.current, transportId: params.id, dtlsParameters };
-        
+        rtcDbg('sendTransport.connect', { callId: payload.callId, transportId: payload.transportId });
 
         socket.current.emit('connect-transport', payload, (response) => {
           if (response?.error) {
@@ -649,14 +679,16 @@ export const RTCProvider = ({ children }) => {
               transportId: payload.transportId,
               error: response.error,
             });
+            rtcDbg('sendTransport.connect.error', { callId: payload.callId, transportId: payload.transportId, error: response.error });
             eb(new Error(response.error));
             return;
           }
-          
+          rtcDbg('sendTransport.connect.ok', { callId: payload.callId, transportId: payload.transportId });
           cb();
         });
       } catch (error) {
         console.error('❌ [RTC] connect-transport socket error (send)', error);
+        rtcDbg('sendTransport.connect.exception', { message: error?.message || String(error) });
         eb(error);
       }
       
@@ -665,6 +697,7 @@ export const RTCProvider = ({ children }) => {
     sendTransport.current.on('produce', ({ kind, rtpParameters }, cb, eb) => {
 
       try {
+        rtcDbg('sendTransport.produce', { callId: currentCallId.current, transportId: params?.id, kind });
         socket.current.emit(
           'create-producer',
           {
@@ -676,16 +709,18 @@ export const RTCProvider = ({ children }) => {
           (response) => {
             if (response?.error) {
               console.error('❌ [RTC] create-producer failed:', response.error, { kind, callId: currentCallId.current });
+              rtcDbg('sendTransport.produce.error', { callId: currentCallId.current, kind, error: response.error });
               eb(new Error(response.error));
               return;
             }
             const producerId = response?.producerId;
-            
+            rtcDbg('sendTransport.produce.ok', { callId: currentCallId.current, kind, producerId });
             cb({ id: producerId });
           }
         );
       } catch (error) {
         console.error('❌ [RTC] Create-producer socket error:', error);
+        rtcDbg('sendTransport.produce.exception', { message: error?.message || String(error) });
         eb(error);
       }
 
@@ -693,30 +728,27 @@ export const RTCProvider = ({ children }) => {
 
     sendTransport.current.on('connectionstatechange', (state) => {
       // Connection state change handler
-      
-      if (state === 'failed' || state === 'disconnected') {
-        
-      }
+      rtcDbg('sendTransport.connectionstatechange', { state });
     });
 
     sendTransport.current.on('icegatheringstatechange', (state) => {
-      // Connection state change handler
-      
+      rtcDbg('sendTransport.icegatheringstatechange', { state });
     });
 
     sendTransport.current.on('icecandidateerror', (error) => {
       // Connection state change handler
-      
+      rtcDbg('sendTransport.icecandidateerror', { error: error?.errorText || error?.message || String(error) });
     });
   };
 
   const createRecvTransport = async (params) => {
     recvTransport.current = device.current.createRecvTransport({...params, iceServers});
+    rtcDbg('recvTransport.created', { transportId: params?.id, callId: currentCallId.current });
 
     recvTransport.current.on('connect', ({ dtlsParameters }, cb, eb) => {
       try {
         const payload = { callId: currentCallId.current, transportId: params.id, dtlsParameters };
-        
+        rtcDbg('recvTransport.connect', { callId: payload.callId, transportId: payload.transportId });
 
         socket.current.emit('connect-transport', payload, (response) => {
           if (response?.error) {
@@ -725,14 +757,16 @@ export const RTCProvider = ({ children }) => {
               transportId: payload.transportId,
               error: response.error,
             });
+            rtcDbg('recvTransport.connect.error', { callId: payload.callId, transportId: payload.transportId, error: response.error });
             eb(new Error(response.error));
             return;
           }
-          
+          rtcDbg('recvTransport.connect.ok', { callId: payload.callId, transportId: payload.transportId });
           cb();
         });
       } catch (error) {
         console.error('❌ [RTC] connect-transport socket error (recv)', error);
+        rtcDbg('recvTransport.connect.exception', { message: error?.message || String(error) });
         eb(error);
       }
       
@@ -740,42 +774,39 @@ export const RTCProvider = ({ children }) => {
 
     recvTransport.current.on('connectionstatechange', (state) => {
       // Connection state change handler
-      
-      if (state === 'failed' || state === 'disconnected') {
-        
-      }
+      rtcDbg('recvTransport.connectionstatechange', { state });
     });
 
     recvTransport.current.on('icegatheringstatechange', (state) => {
       // Connection state change handler
-      
-      });
+      rtcDbg('recvTransport.icegatheringstatechange', { state });
+    });
       
     recvTransport.current.on('icecandidateerror', (error) => {
       // Connection state change handler
-      
-      });
+      rtcDbg('recvTransport.icecandidateerror', { error: error?.errorText || error?.message || String(error) });
+    });
     
   };
 
   /* ================= PRODUCE ================= */
 
   const produce = async (stream, callType) => {
+
     const audio = stream.getAudioTracks()[0];
     const video = stream.getVideoTracks()[0];
 
     
-
     if (audio) {
       const producer = await sendTransport.current.produce({ track: audio });
       producers.current.set('audio', producer);
-      
     }
+
     if (callType === 'video' && video) {
       const producer = await sendTransport.current.produce({ track: video });
       producers.current.set('video', producer);
-      
     }
+    
   };
 
   const toggleMuteProducer = async () => {
@@ -865,7 +896,7 @@ export const RTCProvider = ({ children }) => {
 
     try {
       const data = await new Promise((resolve, reject) => {
-        
+        rtcDbg('create-consumer.emit', { callId: currentCallId.current, producerId, userId: userIdStr });
         socket.current.emit(
           'create-consumer',
           {
@@ -876,8 +907,15 @@ export const RTCProvider = ({ children }) => {
           (response) => {
             if (response.error) {
               console.error('❌ [RTC] create-consumer failed', { producerId, error: response.error });
+              rtcDbg('create-consumer.error', { callId: currentCallId.current, producerId, error: response.error });
               reject(new Error(response.error));
             } else {
+              rtcDbg('create-consumer.ok', {
+                callId: currentCallId.current,
+                producerId,
+                kind: response?.kind,
+                consumerId: response?.id,
+              });
               resolve(response);
             }
           }
@@ -885,6 +923,7 @@ export const RTCProvider = ({ children }) => {
       });
 
       const consumer = await recvTransport.current.consume(data);
+      rtcDbg('recvTransport.consume.ok', { producerId, consumerId: consumer?.id, kind: consumer?.kind, userId: userIdStr });
     
       // Store consumer with userId mapping
       consumers.current.set(producerId, {
@@ -898,11 +937,14 @@ export const RTCProvider = ({ children }) => {
         consumerId: consumer.id,
       }, (response) => {
         if (response?.error) {
-          
+          rtcDbg('resume-consumer.error', { consumerId: consumer.id, error: response.error });
+        } else {
+          rtcDbg('resume-consumer.ok', { consumerId: consumer.id, ...response });
         }
       });
     
       await consumer.resume();
+      rtcDbg('consumer.resume.client_ok', { consumerId: consumer?.id, kind: consumer?.kind });
       
 
     // Map consumer to participant
@@ -916,6 +958,15 @@ export const RTCProvider = ({ children }) => {
     
     if (track) {
       const updatedParticipantStream = streamManager.current.addTrackToParticipantStream(userIdStr, track);
+      rtcDbg('track.attached', {
+        callId: currentCallId.current,
+        userId: userIdStr,
+        producerId,
+        kind: track.kind,
+        participantVideoTracks: updatedParticipantStream?.getVideoTracks?.()?.length || 0,
+        participantAudioTracks: updatedParticipantStream?.getAudioTracks?.()?.length || 0,
+        isGroupCall,
+      });
       
       const initialMutedState = track.muted;
       const initialEnabledState = track.enabled;
@@ -1042,7 +1093,12 @@ export const RTCProvider = ({ children }) => {
         setRemoteStream(remoteCompositeStream);
         setRemoteStreamTracksCount(tracksCount);
         remoteStreamSetRef.current = true;
-        
+        rtcDbg('remoteStream.updated', {
+          userId: userIdStr,
+          tracksCount,
+          videoTracks: videoTracks.length,
+          audioTracks: audioTracks.length,
+        });
       }
     
       // Final audio status check

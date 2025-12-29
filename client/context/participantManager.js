@@ -7,6 +7,20 @@ export class ParticipantManager {
   constructor() {
     this.participantsMap = new Map(); // Map<userId, participantData>
     this.participantStreams = new Map(); // Map<userId, MediaStream>
+
+    // Debug toggle: global.__RTC_DEBUG__ = true/false
+    this._dbgEnabled = () =>
+      (typeof global !== 'undefined' && global.__RTC_DEBUG__ !== undefined)
+        ? !!global.__RTC_DEBUG__
+        : (typeof __DEV__ !== 'undefined' ? __DEV__ : false);
+    this._dbg = (event, data = {}) => {
+      if (!this._dbgEnabled()) return;
+      try {
+        console.log(`[ParticipantManager] ${event}`, data);
+      } catch {
+        // ignore
+      }
+    };
   }
 
   /**
@@ -70,7 +84,7 @@ export class ParticipantManager {
   addParticipant(userId, participantData) {
     const userIdStr = userId.toString();
     if (this.participantsMap.has(userIdStr)) {
-      console.log('⚠️ [ParticipantManager] Participant already exists:', userIdStr);
+      this._dbg('addParticipant.exists', { userId: userIdStr });
       return null;
     }
 
@@ -87,7 +101,7 @@ export class ParticipantManager {
     };
 
     this.participantsMap.set(userIdStr, participant);
-    console.log('✅ [ParticipantManager] Participant added:', userIdStr, participant.name);
+    this._dbg('addParticipant.added', { userId: userIdStr, name: participant.name });
     return participant;
   }
 
@@ -99,7 +113,7 @@ export class ParticipantManager {
   removeParticipant(userId) {
     const userIdStr = userId.toString();
     if (!this.participantsMap.has(userIdStr)) {
-      console.log('⚠️ [ParticipantManager] Participant not found:', userIdStr);
+      this._dbg('removeParticipant.not_found', { userId: userIdStr });
       return false;
     }
 
@@ -117,7 +131,7 @@ export class ParticipantManager {
     }
 
     this.participantsMap.delete(userIdStr);
-    console.log('✅ [ParticipantManager] Participant removed:', userIdStr);
+    this._dbg('removeParticipant.removed', { userId: userIdStr });
     return true;
   }
 

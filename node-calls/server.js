@@ -12,6 +12,18 @@ const cors = require('cors');
 const crypto = require('crypto');
 const { Console } = require('console');
 
+// ---- Debug logging (gated) ----
+// Enable with: CALLS_DEBUG=1 node server.js
+const CALLS_DEBUG = process.env.CALLS_DEBUG === '1';
+const slog = (event, data = {}) => {
+  if (!CALLS_DEBUG) return;
+  try {
+    console.log(`[CALLS] ${event}`, data);
+  } catch {
+    // ignore
+  }
+};
+
 // Database setup for VoIP push notifications (optional - only if SQL_URL is set)
 let sequelize = null;
 let User = null;
@@ -49,8 +61,8 @@ const mediasoupConfig = {
     // IMPORTANT:
     // These ports MUST be open on your server's firewall/security group (UDP + TCP).
     // Group calls create multiple WebRtcTransports, so keep this range comfortably large.
-    rtcMinPort: Number(process.env.MEDIASOUP_RTC_MIN_PORT || 40000),
-    rtcMaxPort: Number(process.env.MEDIASOUP_RTC_MAX_PORT || 40100),
+    rtcMinPort: 40000,
+    rtcMaxPort: 40040,
     logLevel: 'warn',
     logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp'],
   },
@@ -104,10 +116,7 @@ async function createRouter() {
 }
 
 async function createWebRtcTransport(router) {
-  const announcedIp =
-    process.env.MEDIASOUP_ANNOUNCED_IP ||
-    process.env.ANNOUNCED_IP ||
-    '216.126.78.3';
+  const announcedIp = '216.126.78.3';
 
   const transport = await router.createWebRtcTransport({
     listenIps: [
@@ -120,6 +129,33 @@ async function createWebRtcTransport(router) {
     enableTcp: true,
     preferUdp: true,
     initialAvailableOutgoingBitrate: 1000000,
+  });
+
+  // Transport state telemetry (super useful when media is "connecting" or silent)
+  try {
+    transport.on('icestatechange', (iceState) => {
+      slog('transport.icestatechange', { transportId: transport.id, iceState });
+    });
+    transport.on('dtlsstatechange', (dtlsState) => {
+      slog('transport.dtlsstatechange', { transportId: transport.id, dtlsState });
+    });
+    transport.on('sctpstatechange', (sctpState) => {
+      slog('transport.sctpstatechange', { transportId: transport.id, sctpState });
+    });
+    transport.observer?.on?.('close', () => {
+      slog('transport.close', { transportId: transport.id });
+    });
+  } catch {
+    // ignore
+  }
+
+  slog('transport.created', {
+    transportId: transport.id,
+    announcedIp,
+    iceCandidates: transport.iceCandidates?.length,
+    hasUdp: true,
+    hasTcp: true,
+    preferUdp: true,
   });
 
   return {
@@ -140,6 +176,7 @@ io.on('connection', socket => {
   socket.on('register', userId => {
     socket.userId = userId;
     userSockets.set(userId, socket.id);
+    slog('socket.register', { userId, socketId: socket.id });
     
     // Check if there's a pending call for this user (from VoIP push)
     // When user reconnects after VoIP push, resend the incoming-call event
@@ -184,6 +221,7 @@ io.on('connection', socket => {
         }
 
         if (sendTransportParams && recvTransportParams) {
+          slog('incoming-call.resend', { callId, toUserId: userId, fromUserId: callerId });
           socket.emit('incoming-call', {
             callId,
             fromUserId: callerId,
@@ -540,6 +578,7 @@ io.on('connection', socket => {
       const peer = callData.peers.get(socket.userId);
       if (!peer) {
         console.log('🔍 [SERVER] Peer not found for user', socket.userId);
+        slog('connect-transport.peer_not_found', { callId, userId: socket.userId, transportId });
         return cb?.({ error: 'Peer not found' });
       }
 
@@ -551,15 +590,25 @@ io.on('connection', socket => {
           : null;
 
       if (!transport) {
+        slog('connect-transport.transport_not_found', { callId, userId: socket.userId, transportId });
         return cb?.({ error: 'Transport not found' });
       }
 
       const transportType = transport.id === peer.sendTransport.id ? 'Send' : 'Recv';
       console.log('🔌 [SERVER] Connecting', transportType, 'transport', transportId, 'for user', socket.userId);
+      slog('connect-transport', {
+        callId,
+        userId: socket.userId,
+        transportId,
+        transportType,
+        dtlsFingerprints: dtlsParameters?.fingerprints?.map?.(f => f.algorithm) || undefined,
+      });
       await transport.connect({ dtlsParameters });
       console.log('✅ [SERVER] Transport pipeline completed -', transportType, 'transport', transportId, 'connected for user', socket.userId);
+      slog('connect-transport.ok', { callId, userId: socket.userId, transportId, transportType });
       cb?.({ success: true });
     } catch (e) {
+      slog('connect-transport.exception', { callId, userId: socket.userId, transportId, error: e?.message || String(e) });
       cb?.({ error: e.message });
     }
   });
@@ -574,9 +623,11 @@ io.on('connection', socket => {
       }
 
       console.log('📤 [SERVER] Media received from user', socket.userId, '- Kind:', kind);
+      slog('create-producer', { callId, userId: socket.userId, kind });
       const producer = await peer.sendTransport.produce({ kind, rtpParameters });
       peer.producers.set(producer.id, producer);
       console.log('✅ [SERVER] Producer created - ID:', producer.id, 'Kind:', kind, 'Media is being sent from user', socket.userId);
+      slog('create-producer.ok', { callId, userId: socket.userId, kind, producerId: producer.id });
 
       // Listen to producer pause/resume events (for mute functionality)
 
@@ -597,6 +648,7 @@ io.on('connection', socket => {
 
       cb({ producerId: producer.id });
     } catch (e) {
+      slog('create-producer.exception', { callId, userId: socket.userId, kind, error: e?.message || String(e) });
       cb({ error: e.message });
     }
   });
@@ -632,6 +684,7 @@ io.on('connection', socket => {
       }
 
       console.log('📥 [SERVER] Consumer requested by user', socket.userId, 'for producer', producerId, 'kind:', producer.kind);
+      slog('create-consumer', { callId, userId: socket.userId, producerId, kind: producer.kind });
       const consumer = await peer.recvTransport.consume({
         producerId,
         rtpCapabilities,
@@ -640,6 +693,7 @@ io.on('connection', socket => {
 
       peer.consumers.set(producerId, consumer);
       console.log('✅ [SERVER] Consumer created - ID:', consumer.id, 'Kind:', consumer.kind, 'for user', socket.userId);
+      slog('create-consumer.ok', { callId, userId: socket.userId, producerId, consumerId: consumer.id, kind: consumer.kind, paused: consumer.paused });
 
       cb({
         id: consumer.id,
@@ -648,6 +702,7 @@ io.on('connection', socket => {
         rtpParameters: consumer.rtpParameters,
       });
     } catch (e) {
+      slog('create-consumer.exception', { callId, userId: socket.userId, producerId, error: e?.message || String(e) });
       cb({ error: e.message });
     }
   });
@@ -673,11 +728,14 @@ io.on('connection', socket => {
       if (consumer.paused) {
         await consumer.resume();
         console.log('▶️ [SERVER] Consumer resumed - ID:', consumerId, 'Kind:', consumer.kind, 'Media now flowing to user', socket.userId);
+        slog('resume-consumer.ok', { callId, userId: socket.userId, consumerId, kind: consumer.kind });
         cb?.({ success: true });
       } else {
+        slog('resume-consumer.already', { callId, userId: socket.userId, consumerId, kind: consumer.kind });
         cb?.({ success: true, alreadyResumed: true });
       }
     } catch (e) {
+      slog('resume-consumer.exception', { callId, userId: socket.userId, consumerId, error: e?.message || String(e) });
       cb?.({ error: e.message });
     }
   });
