@@ -51,24 +51,27 @@ export const RTCProvider = ({ children }) => {
 
   const iceServers = [
     {
-      urls: 'turn:standard.relay.metered.ca:80',
-      username: 'c8902592aed4c91e18a8d929',
-      credential: 'tqk/vYs01A5r9hj3',
+      urls: "stun:stun.relay.metered.ca:80",
     },
     {
-      urls: 'turn:standard.relay.metered.ca:80?transport=tcp',
-      username: 'c8902592aed4c91e18a8d929',
-      credential: 'tqk/vYs01A5r9hj3',
+      urls: "turn:standard.relay.metered.ca:80",
+      username: "c8902592aed4c91e18a8d929",
+      credential: "tqk/vYs01A5r9hj3",
     },
     {
-      urls: 'turn:standard.relay.metered.ca:443',
-      username: 'c8902592aed4c91e18a8d929',
-      credential: 'tqk/vYs01A5r9hj3',
+      urls: "turn:standard.relay.metered.ca:80?transport=tcp",
+      username: "c8902592aed4c91e18a8d929",
+      credential: "tqk/vYs01A5r9hj3",
     },
     {
-      urls: 'turns:standard.relay.metered.ca:443?transport=tcp',
-      username: 'c8902592aed4c91e18a8d929',
-      credential: 'tqk/vYs01A5r9hj3',
+      urls: "turn:standard.relay.metered.ca:443",
+      username: "c8902592aed4c91e18a8d929",
+      credential: "tqk/vYs01A5r9hj3",
+    },
+    {
+      urls: "turns:standard.relay.metered.ca:443?transport=tcp",
+      username: "c8902592aed4c91e18a8d929",
+      credential: "tqk/vYs01A5r9hj3",
     }
   ];
   
@@ -368,7 +371,7 @@ export const RTCProvider = ({ children }) => {
   /* ================= TRANSPORTS ================= */
 
   const createSendTransport = async (params) => {
-    sendTransport.current = device.current.createSendTransport({...params, iceServers});
+    sendTransport.current = device.current.createSendTransport({...params});
 
     sendTransport.current.on('connect', ({ dtlsParameters }, cb, eb) => {
       try{
@@ -427,7 +430,7 @@ export const RTCProvider = ({ children }) => {
   };
 
   const createRecvTransport = async (params) => {
-    recvTransport.current = device.current.createRecvTransport({...params, iceServers});
+    recvTransport.current = device.current.createRecvTransport({...params});
 
     recvTransport.current.on('connect', ({ dtlsParameters }, cb, eb) => {
       try{
