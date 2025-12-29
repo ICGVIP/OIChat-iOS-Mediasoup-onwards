@@ -79,6 +79,7 @@ export const RTCProvider = ({ children }) => {
   const remoteVideoMutedRef = useRef(false); // Guard to avoid redundant state updates
   const remoteStreamSetRef = useRef(false); // Whether we've ever set remoteStream for current call (1:1)
   const consumingProducerIdsRef = useRef(new Set()); // Prevent duplicate consume() calls per producerId
+  const pendingProducerQueueRef = useRef([]); // Queue new-producer events until recvTransport exists
   const callModeRef = useRef({ isGroupCall: false }); // Avoid relying on React state inside socket handlers
   const callUUID = useRef(null);
   const incomingCallSetupComplete = useRef(null); // Promise resolver for app-killed scenario
@@ -175,7 +176,7 @@ export const RTCProvider = ({ children }) => {
 
     /* ---------- INCOMING CALL ---------- */
     socket.current.on('incoming-call', async (data) => {
-      const { callId, fromUserId, callType, rtpCapabilities, sendTransport, recvTransport, participants } = data;
+      const { callId, fromUserId, callType, rtpCapabilities, participants } = data;
 
       rtcDbg('incoming-call', {
         callId,
@@ -183,17 +184,11 @@ export const RTCProvider = ({ children }) => {
         callType,
         participantsCount: Array.isArray(participants) ? participants.length : undefined,
         hasRtpCaps: !!rtpCapabilities,
-        hasSendTransport: !!sendTransport,
-        hasRecvTransport: !!recvTransport,
       });
 
       // IDEMPOTENCY CHECK: If we already set up for this callId, skip duplicate setup
       // This prevents errors when server resends 'incoming-call' on reconnect
-      if (incomingCallSetupCallId.current === callId && 
-      device.current && 
-      sendTransport.current && 
-      recvTransport.current && 
-      localStream) {
+      if (incomingCallSetupCallId.current === callId) {
         
         // Still update info state and signal completion (in case promise is waiting)
         setInfo({ id: fromUserId, callId, type: callType, name: fromUserId.toString(), participants });
@@ -277,32 +272,8 @@ export const RTCProvider = ({ children }) => {
       }
 
       // Initialize device and create transports BEFORE showing incoming call screen
-      // Only if not already initialized for this call
-      
-      
-      // Reset device/transports if they exist for a different call
-      if (device.current && currentCallId.current !== callId) {
-        
-        device.current = null;
-        sendTransport.current = null;
-        recvTransport.current = null;
-      }
-      
-      await initDevice(rtpCapabilities);
-      await createRecvTransport(recvTransport);
-      await createSendTransport(sendTransport);
-
-      const stream = await getLocalStream(callType);
-      setLocalStream(stream);
-
-      // Initialize participants state for group calls so UI can render tiles
-      if (otherIds.length > 1) {
-        try {
-          initializeParticipants(otherIds, true, stream);
-        } catch (e) {
-          
-        }
-      }
+      // IMPORTANT: We intentionally do NOT create transports or start producing media here.
+      // Transports (and produce/consume) will happen only after user taps Accept via processAccept().
 
       // Update info state (may have been pre-populated from AsyncStorage on connect)
       // This ensures we have the latest data from server
@@ -322,6 +293,7 @@ export const RTCProvider = ({ children }) => {
         callType,
         callerName,
         participants: participantList,
+        rtpCapabilities,
         ...(existingCallData || {}), // Preserve any VoIP push data
       };
       await AsyncStorage.setItem('incomingCallData', JSON.stringify(callData));
@@ -384,6 +356,12 @@ export const RTCProvider = ({ children }) => {
         
         return;
       }
+      // If recv transport isn't ready yet, queue this producer and consume after we create recvTransport.
+      if (!recvTransport.current) {
+        pendingProducerQueueRef.current.push({ producerId, userId });
+        rtcDbg('new-producer.queued', { producerId, kind, userId });
+        return;
+      }
       try {
         await consume(producerId, userId);
       } catch (e) {
@@ -393,55 +371,40 @@ export const RTCProvider = ({ children }) => {
 
     /* ---------- CALL INVITATION (for participants added to existing call) ---------- */
     socket.current.on('call-invitation', async (data) => {
-      const { callId, fromUserId, callType, rtpCapabilities, sendTransport, recvTransport } = data;
+      const { callId, fromUserId, callType, rtpCapabilities } = data;
       
 
       try {
-        // Set current call ID
+        // Treat call-invitation like an incoming call: do NOT create transports or start producing media yet.
         currentCallId.current = callId;
         callUUID.current = callId;
 
-        // Initialize device and transports
-        if (!device.current) {
-          
-          await initDevice(rtpCapabilities);
-        }
-        if (!sendTransport.current) {
-          
-          await createSendTransport(sendTransport);
-        }
-        if (!recvTransport.current) {
-          
-          await createRecvTransport(recvTransport);
-        }
-
-        // Get local stream if not already available
-        if (!localStream) {
-          
-          const stream = await getLocalStream(callType);
-          setLocalStream(stream);
-          await produce(stream, callType);
-          
-        }
-
-        // Update info
-        setInfo({ 
-          id: fromUserId, 
-          callId, 
-          type: callType 
+        setInfo({
+          id: fromUserId,
+          callId,
+          type: callType,
+          name: fromUserId?.toString?.() ?? String(fromUserId),
+          participants: [fromUserId],
         });
 
-        // Accept the invitation
-        socket.current.emit('accept-call', { callId, fromUserId }, async (response) => {
-          if (response?.error) {
-            console.error('❌ [RTC] Error accepting call invitation:', response.error);
-            return;
-          }
-          
-          // Navigate to video call screen
-          navigate('Video Call');
-          // Producers will be sent via new-producer events
-        });
+        try {
+          await AsyncStorage.setItem(
+            'incomingCallData',
+            JSON.stringify({
+              callId,
+              uuid: callUUID.current,
+              callerId: fromUserId,
+              callType,
+              callerName: fromUserId?.toString?.() ?? String(fromUserId),
+              participants: [fromUserId],
+              rtpCapabilities,
+            })
+          );
+        } catch (e) {
+          // ignore
+        }
+
+        navigate('Incoming Call');
       } catch (error) {
         console.error('❌ [RTC] Error handling call invitation:', error);
       }
@@ -670,6 +633,38 @@ export const RTCProvider = ({ children }) => {
     sendTransport.current = device.current.createSendTransport({...params, iceServers});
     rtcDbg('sendTransport.created', { transportId: params?.id, callId: currentCallId.current });
 
+    // CRITICAL: Log ICE state changes
+    sendTransport.current.on('icestatechange', (iceState) => {
+      console.log(`🧊 [RTC] sendTransport ICE state: ${iceState}`);
+      rtcDbg('sendTransport.icestatechange', { iceState, transportId: params?.id });
+    });
+
+    sendTransport.current.on('connectionstatechange', (state) => {
+      console.log(`🔌 [RTC] sendTransport connection state: ${state}`);
+      rtcDbg('sendTransport.connectionstatechange', { state, transportId: params?.id });
+    });
+
+    sendTransport.current.on('icegatheringstatechange', (state) => {
+      console.log(`🧊 [RTC] sendTransport ICE gathering state: ${state}`);
+      rtcDbg('sendTransport.icegatheringstatechange', { state, transportId: params?.id });
+    });
+
+    sendTransport.current.on('icecandidateerror', (event) => {
+      console.error('❌ [RTC] sendTransport ICE candidate error', {
+        address: event.address,
+        port: event.port,
+        url: event.url,
+        errorCode: event.errorCode,
+        errorText: event.errorText,
+      });
+      rtcDbg('sendTransport.icecandidateerror', { 
+        address: event.address,
+        port: event.port,
+        errorCode: event.errorCode,
+        errorText: event.errorText,
+      });
+    });
+
     sendTransport.current.on('connect', ({ dtlsParameters }, cb, eb) => {
       try {
         const payload = { callId: currentCallId.current, transportId: params.id, dtlsParameters };
@@ -728,25 +723,44 @@ export const RTCProvider = ({ children }) => {
       }
 
     });
-
-    sendTransport.current.on('connectionstatechange', (state) => {
-      // Connection state change handler
-      rtcDbg('sendTransport.connectionstatechange', { state });
-    });
-
-    sendTransport.current.on('icegatheringstatechange', (state) => {
-      rtcDbg('sendTransport.icegatheringstatechange', { state });
-    });
-
-    sendTransport.current.on('icecandidateerror', (error) => {
-      // Connection state change handler
-      rtcDbg('sendTransport.icecandidateerror', { error: error?.errorText || error?.message || String(error) });
-    });
   };
 
   const createRecvTransport = async (params) => {
     recvTransport.current = device.current.createRecvTransport({...params, iceServers});
     rtcDbg('recvTransport.created', { transportId: params?.id, callId: currentCallId.current });
+
+    // CRITICAL: Log ICE state changes to diagnose why recv transport never connects
+    recvTransport.current.on('icestatechange', (iceState) => {
+      console.log(`🧊 [RTC] recvTransport ICE state: ${iceState}`);
+      rtcDbg('recvTransport.icestatechange', { iceState, transportId: params?.id });
+    });
+
+    recvTransport.current.on('connectionstatechange', (state) => {
+      console.log(`🔌 [RTC] recvTransport connection state: ${state}`);
+      rtcDbg('recvTransport.connectionstatechange', { state, transportId: params?.id });
+    });
+
+    recvTransport.current.on('icegatheringstatechange', (state) => {
+      console.log(`🧊 [RTC] recvTransport ICE gathering state: ${state}`);
+      rtcDbg('recvTransport.icegatheringstatechange', { state, transportId: params?.id });
+    });
+
+    // This fires when an ICE candidate fails to connect
+    recvTransport.current.on('icecandidateerror', (event) => {
+      console.error('❌ [RTC] recvTransport ICE candidate error', {
+        address: event.address,
+        port: event.port,
+        url: event.url,
+        errorCode: event.errorCode,
+        errorText: event.errorText,
+      });
+      rtcDbg('recvTransport.icecandidateerror', { 
+        address: event.address,
+        port: event.port,
+        errorCode: event.errorCode,
+        errorText: event.errorText,
+      });
+    });
 
     recvTransport.current.on('connect', ({ dtlsParameters }, cb, eb) => {
       try {
@@ -775,20 +789,27 @@ export const RTCProvider = ({ children }) => {
       
     });
 
-    recvTransport.current.on('connectionstatechange', (state) => {
-      // Connection state change handler
-      rtcDbg('recvTransport.connectionstatechange', { state });
-    });
-
-    recvTransport.current.on('icegatheringstatechange', (state) => {
-      // Connection state change handler
-      rtcDbg('recvTransport.icegatheringstatechange', { state });
-    });
-      
-    recvTransport.current.on('icecandidateerror', (error) => {
-      // Connection state change handler
-      rtcDbg('recvTransport.icecandidateerror', { error: error?.errorText || error?.message || String(error) });
-    });
+    // Drain any queued producers now that recvTransport exists
+    try {
+      const queued = pendingProducerQueueRef.current;
+      if (Array.isArray(queued) && queued.length) {
+        pendingProducerQueueRef.current = [];
+        rtcDbg('new-producer.queue.drain', { count: queued.length });
+        for (const p of queued) {
+          try {
+            await consume(p.producerId, p.userId);
+          } catch (e) {
+            console.error('❌ [RTC] consume() failed (queued producer)', {
+              producerId: p?.producerId,
+              userId: p?.userId,
+              error: e?.message || e,
+            });
+          }
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
     
   };
 
@@ -1181,7 +1202,7 @@ export const RTCProvider = ({ children }) => {
             return;
           }
 
-          const { callId, rtpCapabilities, sendTransport, recvTransport } = response;
+          const { callId, rtpCapabilities } = response;
           
 
           currentCallId.current = callId;
@@ -1194,17 +1215,59 @@ export const RTCProvider = ({ children }) => {
             
             await initDevice(rtpCapabilities);
             
+            const joinCall = () =>
+              new Promise((resolve, reject) => {
+                socket.current.emit('join-call', { callId }, (res) => {
+                  if (res?.error) return reject(new Error(res.error));
+                  resolve(res);
+                });
+              });
 
-            
-            await createSendTransport(sendTransport);
-            
+            const createTransport = (direction) =>
+              new Promise((resolve, reject) => {
+                socket.current.emit('create-transport', { callId, direction }, (res) => {
+                  if (res?.error) return reject(new Error(res.error));
+                  resolve(res?.transportOptions);
+                });
+              });
 
-            
-            await createRecvTransport(recvTransport);
-            
-            
-            
-            await produce(stream, callType);
+            const getProducers = () =>
+              new Promise((resolve, reject) => {
+                socket.current.emit('get-producers', { callId }, (res) => {
+                  if (res?.error) return reject(new Error(res.error));
+                  resolve(res?.producers || []);
+                });
+              });
+
+            try {
+              await joinCall();
+              const recvTransportParams = await createTransport('recv');
+              const sendTransportParams = await createTransport('send');
+
+              await createRecvTransport(recvTransportParams);
+              await createSendTransport(sendTransportParams);
+
+              await produce(stream, callType);
+
+              const existing = await getProducers();
+              if (Array.isArray(existing) && existing.length) {
+                for (const p of existing) {
+                  try {
+                    await consume(p.producerId, p.userId);
+                  } catch (e) {
+                    console.error('❌ [RTC] consume() failed (existing producer)', {
+                      producerId: p?.producerId,
+                      userId: p?.userId,
+                      error: e?.message || e,
+                    });
+                  }
+                }
+              }
+            } catch (e) {
+              console.error('❌ [RTC] join/createTransport/getProducers failed (caller):', e?.message || e);
+              Alert.alert('Error', `Failed to join call: ${e?.message || e}`);
+              return;
+            }
             
 
             // Initialize participants (only update state for group calls)
@@ -1394,77 +1457,173 @@ export const RTCProvider = ({ children }) => {
             }
           }
 
-          // Ensure we have the right local media and producers.
-          // We must not duplicate producers (flicker), but we DO want to produce video if this is a video call.
-          let streamToUse = localStream;
-          if (!streamToUse) {
-            streamToUse = await getLocalStream(callTypeToUse);
-            setLocalStream(streamToUse);
-          } else if (callTypeToUse === 'video') {
-            // If we somehow ended up with audio-only stream (e.g., stale info.type), reacquire with video.
-            const hasVideo = (streamToUse.getVideoTracks?.()?.length || 0) > 0;
-            if (!hasVideo) {
+          // Create transports ONLY after accept (join-call), then produce/consume.
+          const rtpCapsToUse = response?.rtpCapabilities;
+          if (!rtpCapsToUse) {
+            console.error('❌ [RTC] accept-call missing rtpCapabilities');
+            acceptInProgressRef.current = false;
+            return;
+          }
+
+          // Reset transports if they exist from a previous call (safety)
+          if (sendTransport.current || recvTransport.current) {
+            try { sendTransport.current?.close?.(); } catch (e) {}
+            try { recvTransport.current?.close?.(); } catch (e) {}
+            sendTransport.current = null;
+            recvTransport.current = null;
+          }
+
+          // Ensure device is initialized
+          await initDevice(rtpCapsToUse);
+
+          const joinCall = () =>
+            new Promise((resolve, reject) => {
+              socket.current.emit('join-call', { callId: callIdToUse }, (res) => {
+                if (res?.error) return reject(new Error(res.error));
+                resolve(res);
+              });
+            });
+
+          const createTransport = (direction) =>
+            new Promise((resolve, reject) => {
+              socket.current.emit('create-transport', { callId: callIdToUse, direction }, (res) => {
+                if (res?.error) return reject(new Error(res.error));
+                resolve(res?.transportOptions);
+              });
+            });
+
+          const getProducers = () =>
+            new Promise((resolve, reject) => {
+              socket.current.emit('get-producers', { callId: callIdToUse }, (res) => {
+                if (res?.error) return reject(new Error(res.error));
+                resolve(res?.producers || []);
+              });
+            });
+
+          try {
+            await joinCall();
+            const recvTransportParams = await createTransport('recv');
+            const sendTransportParams = await createTransport('send');
+
+            await createRecvTransport(recvTransportParams);
+            await createSendTransport(sendTransportParams);
+
+              // Ensure we have the right local media and producers.
+              // We must not duplicate producers (flicker), but we DO want to produce video if this is a video call.
+              let streamToUse = localStream;
+              if (!streamToUse) {
+                streamToUse = await getLocalStream(callTypeToUse);
+                setLocalStream(streamToUse);
+              } else if (callTypeToUse === 'video') {
+                // If we somehow ended up with audio-only stream (e.g., stale info.type), reacquire with video.
+                const hasVideo = (streamToUse.getVideoTracks?.()?.length || 0) > 0;
+                if (!hasVideo) {
+                  try {
+                    const upgraded = await getLocalStream('video');
+                    setLocalStream(upgraded);
+                    streamToUse = upgraded;
+                  } catch (e) {
+                    console.error('❌ [RTC] Failed to upgrade local stream to video:', e);
+                  }
+                }
+              }
+
+              // IMPORTANT: Initialize participants on callee side (so group call shows tiles immediately).
+              // If we don't do this, consume() may run in "group mode" but there will be no participants to attach streams to,
+              // and VideoCall will fall back to the 1:1 "Connecting…" screen with no caller tile.
               try {
-                const upgraded = await getLocalStream('video');
-                setLocalStream(upgraded);
-                streamToUse = upgraded;
+                const myIdStr = user?.data?.id?.toString?.() ?? (user?.data?.id != null ? String(user.data.id) : null);
+
+                // Prefer participants from info (set by incoming-call). Fall back to AsyncStorage (VoIP/app-killed).
+                let participantList = Array.isArray(info?.participants) ? info.participants : null;
+                if (!participantList) {
+                  const saved = await AsyncStorage.getItem('incomingCallData');
+                  if (saved) {
+                    const parsed = JSON.parse(saved);
+                    if (parsed?.callId === callIdToUse && Array.isArray(parsed?.participants)) {
+                      participantList = parsed.participants;
+                    }
+                  }
+                }
+
+                const otherIds = (participantList || [])
+                  .map((x) => (x?.toString?.() ?? String(x)))
+                  .filter((id) => id && (!myIdStr || id !== myIdStr));
+
+                // Group call if there are 2+ other people besides me
+                if (otherIds.length > 1) {
+                  initializeParticipants(otherIds, true, streamToUse);
+                  setCallInfo({ callId: callIdToUse, type: callTypeToUse, participantCount: otherIds.length + 1 });
+                } else {
+                  // Ensure 1:1 mode so consume() updates remoteStream
+                  callModeRef.current.isGroupCall = false;
+                }
               } catch (e) {
-                console.error('❌ [RTC] Failed to upgrade local stream to video:', e);
+                // ignore UI init failures; media should still work
               }
-            }
+
+              const audioProducer = producers.current.get('audio');
+              const videoProducer = producers.current.get('video');
+
+              // Always ensure audio producer exists
+              if (!audioProducer) {
+                try {
+                  const audioTrack = streamToUse?.getAudioTracks?.()?.[0];
+                  if (audioTrack) {
+                    const p = await sendTransport.current.produce({ track: audioTrack });
+                    producers.current.set('audio', p);
+                  }
+                } catch (e) {
+                  console.error('❌ [RTC] Failed to produce audio on accept:', e);
+                }
+              }
+
+              // Ensure video producer exists when call is video
+              if (callTypeToUse === 'video' && !videoProducer) {
+                try {
+                  const videoTrack = streamToUse?.getVideoTracks?.()?.[0];
+                  if (videoTrack) {
+                    const p = await sendTransport.current.produce({ track: videoTrack });
+                    producers.current.set('video', p);
+                  }
+                } catch (e) {
+                  console.error('❌ [RTC] Failed to produce video on accept:', e);
+                }
+              }
+
+              const existing = await getProducers();
+              if (Array.isArray(existing) && existing.length) {
+                for (const p of existing) {
+                  try {
+                    await consume(p.producerId, p.userId);
+                  } catch (e) {
+                    console.error('❌ [RTC] consume() failed (existing producer)', {
+                      producerId: p?.producerId,
+                      userId: p?.userId,
+                      error: e?.message || e,
+                    });
+                  }
+                }
+              }
+
+              // Resolve setup promise if waiting (for app-killed scenario)
+              if (incomingCallSetupComplete.current) {
+                incomingCallSetupComplete.current();
+                incomingCallSetupComplete.current = null;
+                incomingCallSetupCallId.current = currentCallId.current;
+                
+              }
+
+              navigate('Video Call');
+              
+              acceptedCallIdRef.current = callIdToUse;
+              acceptInProgressRef.current = false;
+          } catch (e) {
+            console.error('❌ [RTC] join/createTransport/getProducers failed (callee):', e?.message || e);
+            acceptInProgressRef.current = false;
+            return;
           }
 
-          const audioProducer = producers.current.get('audio');
-          const videoProducer = producers.current.get('video');
-
-          // Always ensure audio producer exists
-          if (!audioProducer) {
-            try {
-              const audioTrack = streamToUse?.getAudioTracks?.()?.[0];
-              if (audioTrack) {
-                const p = await sendTransport.current.produce({ track: audioTrack });
-                producers.current.set('audio', p);
-              }
-            } catch (e) {
-              console.error('❌ [RTC] Failed to produce audio on accept:', e);
-            }
-          }
-
-          // Ensure video producer exists when call is video
-          if (callTypeToUse === 'video' && !videoProducer) {
-            try {
-              const videoTrack = streamToUse?.getVideoTracks?.()?.[0];
-              if (videoTrack) {
-                const p = await sendTransport.current.produce({ track: videoTrack });
-                producers.current.set('video', p);
-              }
-            } catch (e) {
-              console.error('❌ [RTC] Failed to produce video on accept:', e);
-            }
-          }
-
-        // Resolve setup promise if waiting (for app-killed scenario)
-        if (incomingCallSetupComplete.current) {
-          incomingCallSetupComplete.current();
-          incomingCallSetupComplete.current = null;
-          incomingCallSetupCallId.current = currentCallId.current;
-          
-        }
-
-        navigate('Video Call');
-        
-        // Ensure audio is routed correctly after accepting
-        // if (info.type === 'video') {
-        //   InCallManager.setForceSpeakerphoneOn(true);
-        // }
-
-        // InCallManager.stopRingtone();
-        // InCallManager.start({ media: info.type === 'video' ? 'video' : 'audio' });
-
-        
-
-          acceptedCallIdRef.current = callIdToUse;
-          acceptInProgressRef.current = false;
         }
       );
     } catch (e) {

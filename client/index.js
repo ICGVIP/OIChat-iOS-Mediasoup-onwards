@@ -13,7 +13,7 @@ const options = {
 }
 
 registerGlobals();
-
+global.__RTC_DEBUG__ = true;
 
 VoipPushNotification.addEventListener('notification', async (voipPayload)=>{
 
