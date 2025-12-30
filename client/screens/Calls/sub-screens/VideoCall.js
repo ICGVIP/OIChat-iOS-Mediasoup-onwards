@@ -30,13 +30,46 @@ const barWidth = windowWidth*0.85;
 const topMargin = windowHeight*0.08;
 
 /* ================= PARTICIPANT VIEW COMPONENT ================= */
-const ParticipantView = ({ participant, style }) => {
-    const { userId, name, avatar, stream, muted, isLocal, streamKey } = participant;
-    const hasVideo = !!stream && stream.getVideoTracks().length > 0 && !muted.video;
-    const isRinging = !isLocal && !stream; // no stream yet => user hasn't joined
+const ParticipantView = ({ participant, style, localMicStatus, localVideoStatus, reactionEmoji, callType }) => {
+    const { userId, name, firstName, lastName, username, avatar, stream, muted, isLocal, streamKey } = participant;
+    
+    // Use participant.muted for all users (including local) - it's updated by toggle functions
+    // For local user, also check localMicStatus/localVideoStatus as backup if muted object is stale
+    const isMicMuted = !!muted?.mic || (isLocal && localMicStatus === false);
+    const isVideoMuted = !!muted?.video || (isLocal && localVideoStatus === false);
+    
+    const isAudioCall = callType === 'audio';
+    const hasVideo = !isAudioCall && !!stream && stream.getVideoTracks().length > 0 && !isVideoMuted;
+    const isRinging = !isLocal && !stream && participant?.callStatus === 'invited'; // invited but not joined yet
+
+    // Build display name: prefer name, then firstName/lastName, then username, then fallback.
+    // IMPORTANT: Never show raw userId as a display name.
+    const displayName = isLocal 
+        ? 'You' 
+        : (name && name !== 'Unknown' && name !== userId?.toString())
+            ? name
+            : (firstName || lastName)
+                ? `${firstName || ''} ${lastName || ''}`.trim()
+                : (username ? String(username) : 'Unknown');
 
     return (
         <View style={[styles.participantContainer, style]}>
+                {/* Reaction (top-center, 30s TTL) */}
+                {!!reactionEmoji && (
+                    <View style={{
+                        position: 'absolute',
+                        top: 8,
+                        alignSelf: 'center',
+                        zIndex: 250,
+                        elevation: 250,
+                        backgroundColor: 'rgba(0,0,0,0.25)',
+                        paddingHorizontal: 10,
+                        paddingVertical: 6,
+                        borderRadius: 16,
+                    }}>
+                        <Text style={{ fontSize: 26 }}>{reactionEmoji}</Text>
+                    </View>
+                )}
             {hasVideo ? (
                 <RTCView
                     key={`rtc-${userId}-${streamKey || 0}`}
@@ -50,41 +83,62 @@ const ParticipantView = ({ participant, style }) => {
                     {avatar ? (
                         <Avatar.Image size={60} source={{ uri: avatar }} />
                     ) : (
-                        <Avatar.Text size={60} label={name?.charAt(0)?.toUpperCase() || '?'} />
+                        <Avatar.Text size={60} label={displayName?.charAt(0)?.toUpperCase() || '?'} />
+                    )}
+                    {/* Show camera-off icon for local user when video is muted */}
+                    {isLocal && isVideoMuted && (
+                        <View style={{ marginTop: 8, marginBottom: 4 }}>
+                            <Feather name="video-off" size={24} color="rgba(255,255,255,0.7)" />
+                        </View>
                     )}
                     <Text style={styles.participantNameFallback} numberOfLines={1} ellipsizeMode="tail">
-                        {isLocal ? 'You' : (name || userId)}
+                        {displayName}
                     </Text>
-                    {!isLocal && (
+                        {/* Status line */}
                         <Text style={styles.participantStatusText} numberOfLines={1} ellipsizeMode="tail">
-                            {isRinging ? 'Ringing…' : (muted.video ? 'Video off' : 'Connecting…')}
+                            {isRinging
+                                ? 'Ringing…'
+                                : (isAudioCall ? 'Audio call' : (isVideoMuted ? 'Video off' : 'Connecting…'))}
                         </Text>
-                    )}
                 </View>
             )}
             
             {/* Mute indicators overlay */}
             <View style={styles.participantOverlay}>
-                {muted.mic && (
+                {isMicMuted && (
                     <View style={styles.muteIndicator}>
                         <Feather name="mic-off" size={16} color="white" />
                     </View>
                 )}
-                {muted.video && (
+                {isVideoMuted && (
                     <View style={styles.muteIndicator}>
                         <Feather name="video-off" size={16} color="white" />
                     </View>
                 )}
-                <Text style={styles.participantNameOverlay} numberOfLines={1} ellipsizeMode="tail">
-                    {isLocal ? 'You' : (name || userId)}
-                </Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                    <Text style={styles.participantNameOverlay} numberOfLines={1} ellipsizeMode="tail">
+                        {displayName}
+                    </Text>
+                    {/* Show mic icon next to "You" when local user mutes mic */}
+                    {isLocal && isMicMuted && (
+                        <Feather name="mic-off" size={14} color="rgba(255,255,255,0.8)" />
+                    )}
+                </View>
             </View>
         </View>
     );
 };
 
 /* ================= GROUP CALL VIEW COMPONENT ================= */
-const GroupCallView = ({ participants, localStream }) => {
+const GroupCallView = ({ participants, localStream, localMicStatus, localVideoStatus, reactionsByUser, callType }) => {
+    // Debug log to see what participants we're receiving
+    useEffect(() => {
+        console.log('📊 [GroupCallView] Received participants:', {
+            count: participants?.length || 0,
+            userIds: participants?.map(p => ({ userId: p.userId, callStatus: p.callStatus, isLocal: p.isLocal, hasStream: !!p.stream })) || [],
+        });
+    }, [participants]);
+    
     // Ensure local participant is first
     const sortedParticipants = useMemo(() => {
         const local = participants.find(p => p.isLocal);
@@ -108,12 +162,16 @@ const GroupCallView = ({ participants, localStream }) => {
                 padding: gridPadding,
                 paddingTop: gridPadding + 16,
                 paddingBottom: 220,
-                backgroundColor: '#0B0B0F', // same in light/dark
+                backgroundColor: 'rgba(70,70,70,0.3)', // Greyish background like 1:1 calls // same in light/dark
             }}
             columnWrapperStyle={{ justifyContent: 'space-between' }}
             renderItem={({ item }) => (
                 <ParticipantView
                     participant={item}
+                    localMicStatus={localMicStatus}
+                    localVideoStatus={localVideoStatus}
+                    callType={callType}
+                    reactionEmoji={reactionsByUser?.[item?.userId?.toString?.() ?? String(item?.userId)]?.emoji || null}
                     style={{
                         width: tileWidth,
                         height: tileHeight,
@@ -177,56 +235,87 @@ const VideoCall = ({navigation}) => {
     }, [insets.top, screenHeight]);
     const [showAddMembers, setShowAddMembers] = useState(false);
     const [searchText, setSearchText] = useState('');
-    // Track which contacts are being added - same structure as NewCall.js selected array
-    const [addingMembers, setAddingMembers] = useState([]); // Array of {name, id, phone} objects
+    const [isAddingMembersToCall, setIsAddingMembersToCall] = useState(false);
     const [emojiPicker, setEmojiPicker] = useState(false);
-    const [selectedEmoji, setSelectedEmoji] = useState(null); // Store the selected emoji
+    // Reactions (server-broadcast) – keyed by userId -> { emoji, ts }
+    const [reactionsByUser, setReactionsByUser] = useState({});
+    const reactionTimersRef = useRef(new Map()); // Map<userIdStr, timeoutId>
+
+    // IDs currently in the call (joined or invited). Used to disable "+ Add" for those contacts.
+    const inCallIdSet = useMemo(() => {
+        const s = new Set();
+        try {
+            if (user?.data?.id != null) s.add(String(user.data.id));
+            if (info?.id != null) s.add(String(info.id)); // 1:1 remote partner
+            (Array.isArray(info?.participants) ? info.participants : []).forEach((x) => {
+                const idStr = x?.toString?.() ?? String(x);
+                if (idStr) s.add(idStr);
+            });
+            (Array.isArray(participantsList) ? participantsList : []).forEach((p) => {
+                const idStr = p?.userId?.toString?.() ?? String(p?.userId);
+                if (idStr) s.add(idStr);
+            });
+        } catch {}
+        s.delete('');
+        s.delete('undefined');
+        s.delete('null');
+        return s;
+    }, [participantsList, info?.id, info?.participants, user?.data?.id]);
       
 
     useEffect(() => {
-
         // Force speaker for video calls
         if (info?.type === 'video') {
-            console.log('...We Here....\n\n');
-            InCallManager.setForceSpeakerphoneOn(true);
+            try { InCallManager.setForceSpeakerphoneOn(true); } catch {}
         }
 
-        // Prioritize name from info (set from VoIP push or incoming-call event)
-        if (info?.name && info.name !== 'Unknown') {
-            setName(info.name);
-            // Try to extract firstName and lastName from info.name if available
-            const nameParts = info.name.split(' ');
-            if (nameParts.length >= 2) {
-                setFirstName(nameParts[0]);
-                setLastName(nameParts.slice(1).join(' '));
-            }
-        }
+        // Reset derived UI state whenever call partner changes (prevents stale group names after group -> 1:1 downgrade)
+        setFirstName('');
+        setLastName('');
+        setPic('');
 
-        // Also check contacts for additional info (avatar, etc.)
-        if (Array.isArray(contacts)) {
+        // Resolve name: prefer info.name (rtc.js updates this on group -> 1:1 downgrade), otherwise contacts.
+        let resolvedName = (info?.name && info.name !== 'Unknown') ? info.name : null;
+
+        let matchedContact = null;
+        if (Array.isArray(contacts) && info?.id != null) {
             for (let i of contacts) {
-                if (i.isRegistered && i.server_info.id === info.id) {
-                    // Use name from info if available, otherwise use contact name
-                    if (!info?.name || info.name === 'Unknown') {
-                    setName(i.item.name);
-                    }
-                    setPic(i.server_info.avatar);
-                    // Get firstName and lastName from contacts if not already set
-                    if (!firstName && !lastName) {
-                        setFirstName(i.item.firstName || '');
-                        setLastName(i.item.lastName || '');
-                    }
+                if (i?.isRegistered && i?.server_info?.id === info.id) {
+                    matchedContact = i;
+                    break;
                 }
             }
         }
 
-        return () => {
-            // Optional: stop tracks here again just in case
-            // if (localStream) {
-            //   localStream.getTracks().forEach(track => track.stop());
-            // }
-        };
-    }, []);
+        if (!resolvedName && matchedContact?.item) {
+            resolvedName = matchedContact.item.name || `${matchedContact.item.firstName || ''} ${matchedContact.item.lastName || ''}`.trim();
+        }
+
+        setName(resolvedName || 'OIChat User');
+
+        // Avatar
+        if (matchedContact?.server_info?.avatar) {
+            setPic(matchedContact.server_info.avatar);
+        }
+
+        // Only derive first/last when it looks like a single-person name (avoid parsing group titles like "A & B" / "A, B +1")
+        const n = (resolvedName || '').toString();
+        const looksLikeGroup = n.includes('&') || n.includes('+') || n.includes(',');
+        if (!looksLikeGroup) {
+            const parts = n.trim().split(/\s+/).filter(Boolean);
+            if (parts.length >= 2) {
+                setFirstName(parts[0]);
+                setLastName(parts.slice(1).join(' '));
+            } else if (matchedContact?.item?.firstName || matchedContact?.item?.lastName) {
+                setFirstName(matchedContact.item.firstName || '');
+                setLastName(matchedContact.item.lastName || '');
+            }
+        } else if (matchedContact?.item?.firstName || matchedContact?.item?.lastName) {
+            // If we matched a contact, we can still show their first/last even if the resolvedName is a group title.
+            setFirstName(matchedContact.item.firstName || '');
+            setLastName(matchedContact.item.lastName || '');
+        }
+    }, [info?.id, info?.name, info?.type, contacts]);
 
     useEffect(() => {
         // Track status changes
@@ -243,6 +332,90 @@ const VideoCall = ({navigation}) => {
             remoteStreamURL: remoteStream && typeof remoteStream.toURL === 'function' ? remoteStream.toURL() : 'no toURL method'
         });
     }, [micStatus, videoStatus, remoteStream, remoteMicMuted, remoteStreamTracksCount, remoteVideoMuted]);
+
+    // Reaction handling (30s TTL, replace on new reaction per user)
+    const callIdForReactions = useMemo(() => (callInfo?.callId || info?.callId || null), [callInfo?.callId, info?.callId]);
+    const localUserIdStr = useMemo(() => (user?.data?.id != null ? String(user.data.id) : null), [user?.data?.id]);
+
+    const applyReaction = useCallback(({ userId, emoji, ts }) => {
+        const uidStr = userId != null ? String(userId) : null;
+        const e = (emoji ?? '').toString();
+        if (!uidStr || !e) return;
+
+        // Replace existing timer for this user
+        try {
+            const prev = reactionTimersRef.current.get(uidStr);
+            if (prev) clearTimeout(prev);
+        } catch {}
+
+        setReactionsByUser(prev => ({
+            ...(prev || {}),
+            [uidStr]: { emoji: e, ts: typeof ts === 'number' ? ts : Date.now() },
+        }));
+
+        // Remove after 30s
+        const t = setTimeout(() => {
+            setReactionsByUser(prev => {
+                const next = { ...(prev || {}) };
+                delete next[uidStr];
+                return next;
+            });
+            try { reactionTimersRef.current.delete(uidStr); } catch {}
+        }, 30000);
+        reactionTimersRef.current.set(uidStr, t);
+    }, []);
+
+    const sendReaction = useCallback((emojiStr) => {
+        if (!callIdForReactions || !localUserIdStr) return;
+        const e = (emojiStr ?? '').toString();
+        if (!e) return;
+
+        // Apply locally immediately
+        applyReaction({ userId: localUserIdStr, emoji: e, ts: Date.now() });
+
+        // Broadcast to call participants
+        try {
+            socket?.emit?.('call-reaction', { callId: callIdForReactions, emoji: e }, () => {});
+        } catch {}
+    }, [applyReaction, callIdForReactions, localUserIdStr, socket]);
+
+    useEffect(() => {
+        if (!socket?.on) return;
+        const onReaction = (payload) => {
+            if (!payload) return;
+            const { callId, userId, emoji, ts } = payload;
+            // Only accept reactions for this call
+            if (callIdForReactions && callId && String(callId) !== String(callIdForReactions)) return;
+            applyReaction({ userId, emoji, ts });
+        };
+        socket.on('call-reaction', onReaction);
+        return () => {
+            try { socket.off('call-reaction', onReaction); } catch {}
+        };
+    }, [socket, applyReaction, callIdForReactions]);
+
+    // Cleanup timers when leaving call / switching calls
+    useEffect(() => {
+        setReactionsByUser({});
+        try {
+            reactionTimersRef.current.forEach((t) => clearTimeout(t));
+            reactionTimersRef.current.clear();
+        } catch {}
+    }, [callIdForReactions]);
+
+    const isGroupUI = ((participantsList && participantsList.length > 2) || (callInfo?.participantCount && callInfo.participantCount > 2));
+
+    // For 1:1 UI, show the most recent reaction (from either user) at top-center below pillTop.
+    const latestReactionEmoji = useMemo(() => {
+        const entries = Object.entries(reactionsByUser || {});
+        if (!entries.length) return null;
+        let best = null;
+        for (const [, v] of entries) {
+            if (!v?.emoji) continue;
+            if (!best || (v.ts || 0) > (best.ts || 0)) best = v;
+        }
+        return best?.emoji || null;
+    }, [reactionsByUser]);
 
     // Focused group-call debug logs (safe to keep during rollout)
     useEffect(() => {
@@ -479,6 +652,12 @@ const VideoCall = ({navigation}) => {
 
     const handleSheetChanges = useCallback((index) => {
         console.log('Bottom sheet index:', index);
+        // If sheet is closed, reset add-members UI state
+        if (index === -1) {
+            setShowAddMembers(false);
+            setSearchText('');
+            setIsAddingMembersToCall(false);
+        }
     }, []);
 
     const handleSendMessage = () => {
@@ -498,37 +677,22 @@ const VideoCall = ({navigation}) => {
         bottomSheetModalRef.current?.snapToIndex(1);
     };
 
-    const handleAddContact = (contact) => {
-        // Same logic as NewCall.js ContactItem handleSelection
-        const existingObj = addingMembers.find(i => i.id === contact.server_info.id);
-        if (existingObj) {
-            // Remove from array if already selected
-            setAddingMembers(prev => prev.filter(i => i.id !== contact.server_info.id));
-        } else {
-            // Add to array with same structure as NewCall.js: {name, id, phone}
-            setAddingMembers(prev => [...prev, {
-                name: contact.item.name,
-                id: contact.server_info.id,
-                phone: contact.server_info.phone
-            }]);
-        }
-    };
-
-    // Function to add members to call
-    const addToCall = async () => {
-        const memberIds = addingMembers.map(member => member.id);
-        
-        if (memberIds.length === 0) {
-            return;
-        }
-
+    // Add a single member immediately (what users expect when tapping "+ Add")
+    const addSingleToCall = async (contact) => {
+        const memberId = contact?.server_info?.id;
+        if (!memberId) return;
+        if (isAddingMembersToCall) return;
+        setIsAddingMembersToCall(true);
         try {
-            await addParticipantsToCall(memberIds);
-            setAddingMembers([]); // Clear selection
+            await addParticipantsToCall([memberId]);
+            setShowAddMembers(false);
+            setSearchText('');
             bottomSheetModalRef.current?.dismiss();
         } catch (error) {
-            console.error('❌ [VideoCall] Error adding members:', error);
-            Alert.alert('Error', 'Failed to add members to call');
+            console.error('❌ [VideoCall] Error adding single member:', error);
+            Alert.alert('Error', 'Failed to add member to call');
+        } finally {
+            setIsAddingMembersToCall(false);
         }
     };
 
@@ -570,246 +734,237 @@ const VideoCall = ({navigation}) => {
             </View>
 
             {/*Upper Actions - Video/Audio Content*/}
-            {info?.type === 'video' ? (
+            {isGroupUI ? (
+                <GroupCallView 
+                    participants={participantsList} 
+                    localStream={localStream}
+                    localMicStatus={micStatus}
+                    localVideoStatus={videoStatus}
+                    reactionsByUser={reactionsByUser}
+                    callType={info?.type}
+                />
+            ) : (
                 <>
-                    {/* Group call view (3+ participants) */}
-                    {participantsList && participantsList.length > 2 ? (
-                        <GroupCallView participants={participantsList} localStream={localStream} />
-                    ) : (
+                    {/* 1:1 Reaction (top-center, below pillTop) */}
+                    {!!latestReactionEmoji && (
+                        <View style={{
+                            position: 'absolute',
+                            top: insets.top + 10 + 44 + 10,
+                            alignSelf: 'center',
+                            zIndex: 250,
+                            elevation: 250,
+                            backgroundColor: 'rgba(0,0,0,0.25)',
+                            paddingHorizontal: 12,
+                            paddingVertical: 8,
+                            borderRadius: 18,
+                        }}>
+                            <Text style={{ fontSize: 30 }}>{latestReactionEmoji}</Text>
+                        </View>
+                    )}
+
+                    {info?.type === 'video' ? (
                         <>
+                            {/* existing 1:1 video UI stays as-is below */}
                             {/* ✅ Full Screen Video - Swaps between local and remote based on streamsSwapped state */}
                             {!streamsSwapped ? (
-                        <>
-                            {/* Remote video full screen OR fallback */}
-                            {(() => {
-                                const hasRemoteVideoTrack = !!remoteStream && (remoteStream.getVideoTracks?.()?.length || 0) > 0;
-                                const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
-
-                                if (canRenderRemote) {
-                                    return (
-                                        <RTCView
-                                            key={`remote-${remoteStream.id}-${remoteStreamTracksCount}`}
-                                            streamURL={remoteStream.toURL()}
-                                            objectFit="cover"
-                                            style={StyleSheet.absoluteFill}
-                                            zOrder={0}
-                                            mirror={false}
-                                        />
-                                    );
-                                }
-
-                                const statusText = remoteVideoMuted ? 'Video is off' : 'Connecting…';
-                                return (
-                                <View style={[
-                                    StyleSheet.absoluteFill, 
-                                    { 
-                                        justifyContent: 'center', 
-                                        alignItems: 'center', 
-                                        backgroundColor: '#111',
-                                        zIndex: 2,
-                                        elevation: 2,
-                                    }
-                                ]}>
-                                    <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
-                                    <Text style={{ color: 'white', marginTop: 12, fontSize: 16 }}>
-                                        {firstName && lastName 
-                                            ? `${firstName} ${lastName}`
-                                            : name}
-                                    </Text>
-                                    <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 4, fontSize: 14 }}>{statusText}</Text>
-                                </View>
-                                );
-                            })()}
-                        </>
-                    ) : (
-                        <>
-                            {/* Local video full screen */}
-                            {localStream && (
                                 <>
-                                    {video ? (
-                                        <RTCView
-                                            streamURL={localStream.toURL()}
-                                            objectFit="cover"
-                                            style={StyleSheet.absoluteFill}
-                                            zOrder={0}
-                                            mirror={true}
-                                        />
-                                    ) : (
-                                        <View style={[
-                                            StyleSheet.absoluteFill, 
-                                            { 
-                                                justifyContent: 'center', 
-                                                alignItems: 'center', 
-                                                backgroundColor: 'rgba(255,255,255,0.5)',
-                                                zIndex: 2,
-                                                elevation: 2,
-                                            }
-                                        ]}>
-                                            <Feather name="video-off" size={48} color="#444" />
-                                        </View>
-                                    )}
-                                    {/* Emoji display at top center */}
-                                    {selectedEmoji && (
-                                        <View style={{
-                                            position: 'absolute',
-                                            top: insets.top + 20,
-                                            alignSelf: 'center',
-                                            zIndex: 200,
-                                            elevation: 200,
-                                        }}>
-                                            <Avatar.Icon
-                                                size={45}
-                                                icon={() => <Text style={{ fontSize: 30 }}>{selectedEmoji}</Text>}
-                                                style={{ backgroundColor: 'transparent' }}
-                                            />
-                                        </View>
+                                    {/* Remote video full screen OR fallback */}
+                                    {(() => {
+                                        const hasRemoteVideoTrack = !!remoteStream && (remoteStream.getVideoTracks?.()?.length || 0) > 0;
+                                        const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
+
+                                        if (canRenderRemote) {
+                                            return (
+                                                <RTCView
+                                                    key={`remote-${remoteStream.id}-${remoteStreamTracksCount}`}
+                                                    streamURL={remoteStream.toURL()}
+                                                    objectFit="cover"
+                                                    style={StyleSheet.absoluteFill}
+                                                    zOrder={0}
+                                                    mirror={false}
+                                                />
+                                            );
+                                        }
+
+                                        const statusText = remoteVideoMuted ? 'Video is off' : 'Connecting…';
+                                        return (
+                                            <View style={[
+                                                StyleSheet.absoluteFill, 
+                                                { 
+                                                    justifyContent: 'center', 
+                                                    alignItems: 'center', 
+                                                    backgroundColor: '#111',
+                                                    zIndex: 2,
+                                                    elevation: 2,
+                                                }
+                                            ]}>
+                                                <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
+                                                <Text style={{ color: 'white', marginTop: 12, fontSize: 16 }}>
+                                                    {firstName && lastName 
+                                                        ? `${firstName} ${lastName}`
+                                                        : name}
+                                                </Text>
+                                                <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 4, fontSize: 14 }}>{statusText}</Text>
+                                            </View>
+                                        );
+                                    })()}
+                                </>
+                            ) : (
+                                <>
+                                    {/* Local video full screen */}
+                                    {localStream && (
+                                        <>
+                                            {video ? (
+                                                <RTCView
+                                                    streamURL={localStream.toURL()}
+                                                    objectFit="cover"
+                                                    style={StyleSheet.absoluteFill}
+                                                    zOrder={0}
+                                                    mirror={true}
+                                                />
+                                            ) : (
+                                                <View style={[
+                                                    StyleSheet.absoluteFill, 
+                                                    { 
+                                                        justifyContent: 'center', 
+                                                        alignItems: 'center', 
+                                                        backgroundColor: 'rgba(255,255,255,0.5)',
+                                                        zIndex: 2,
+                                                        elevation: 2,
+                                                    }
+                                                ]}>
+                                                    <Feather name="video-off" size={48} color="#444" />
+                                                </View>
+                                            )}
+                                        </>
                                     )}
                                 </>
                             )}
-                        </>
-                    )}
 
-                    {/* ✅ Remote mic muted notice at top */}
-                    {remoteMicMuted && (
-                    <View style={{
-                        position: 'absolute',
-                        top: insets.top + 10,
-                        alignSelf: 'center',
-                        backgroundColor: 'rgba(0,0,0,0.6)',
-                        paddingHorizontal: 12,
-                        paddingVertical: 6,
-                        borderRadius: 20,
-                        zIndex: 100,
-                        elevation: 100,
-                    }}>
-                        <Text style={{ color: 'white', fontSize: 14 }}>
-                            {firstName && lastName 
-                                ? `${firstName} ${lastName} is muted`
-                                : (info?.name || name || 'User') + ' is muted'}
-                        </Text>
-                    </View>
-                    )}
+                            {/* ✅ Remote mic muted notice at top */}
+                            {remoteMicMuted && (
+                                <View style={{
+                                    position: 'absolute',
+                                    top: insets.top + 10,
+                                    alignSelf: 'center',
+                                    backgroundColor: 'rgba(0,0,0,0.6)',
+                                    paddingHorizontal: 12,
+                                    paddingVertical: 6,
+                                    borderRadius: 20,
+                                    zIndex: 100,
+                                    elevation: 100,
+                                }}>
+                                    <Text style={{ color: 'white', fontSize: 14 }}>
+                                        {firstName && lastName 
+                                            ? `${firstName} ${lastName} is muted`
+                                            : (info?.name || name || 'User') + ' is muted'}
+                                    </Text>
+                                </View>
+                            )}
 
-                    {/* ✅ Small Preview - Swaps between local and remote based on streamsSwapped state */}
-                    <TouchableOpacity 
-                        activeOpacity={0.8}
-                        onPress={() => setStreamsSwapped(!streamsSwapped)}
-                        style={{
-                        position: 'absolute',
-                            top: insets.top + 10 + 44 + 20, // insets.top + pillTop marginTop (10) + icon height (44) + gap (10)
-                        right: 20,
-                        width: windowWidth * 0.3,
-                        height: windowWidth * 0.45,
-                        backgroundColor: '#000',
-                        borderRadius: 10,
-                        overflow: 'hidden',
-                        zIndex: 10,
-                        justifyContent: 'center',
-                        alignItems: 'center',
-                        }}
-                    >
-                        {!streamsSwapped ? (
-                            <>
-                                {/* Local video small preview */}
-                        {video ? (
-                        <RTCView
-                                        streamURL={localStream?.toURL()}
-                            objectFit="cover"
-                            style={{ width: '100%', height: '100%' }}
-                                        mirror={true}
-                        />
-                        ) : (
-                        <View style={{
-                            ...StyleSheet.absoluteFillObject,
-                            backgroundColor: 'rgba(255,255,255,0.5)',
-                            justifyContent: 'center',
-                            alignItems: 'center',
-                        }}>
-                            <Feather name="video-off" size={28} color="#444" />
-                        </View>
-                        )}
-
-                                {/* Emoji display at top center of small preview */}
-                                {selectedEmoji && (
-                                    <View style={{
-                                        position: 'absolute',
-                                        top: 8,
-                                        alignSelf: 'center',
-                                        zIndex: 200,
-                                        elevation: 200,
-                                    }}>
-                                        <Avatar.Icon
-                                            size={40}
-                                            icon={() => <Text style={{ fontSize: 30 }}>{selectedEmoji}</Text>}
-                                            style={{ backgroundColor: 'transparent' }}
-                                        />
-                                    </View>
-                                )}
-
-                        {video && !mic && (
-                        <View style={{
-                            position: 'absolute',
-                            bottom: 6,
-                            alignSelf: 'center',
-                            backgroundColor: 'rgba(0,0,0,0.6)',
-                            padding: 4,
-                            borderRadius: 20,
-                        }}>
-                            <Feather name="mic-off" size={20} color="white" />
-                        </View>
-                        )}
-                            </>
-                        ) : (
-                            <>
-                                {/* Remote video small preview */}
-                                {(() => {
-                                    const hasRemoteVideoTrack = !!remoteStream && (remoteStream.getVideoTracks?.()?.length || 0) > 0;
-                                    const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
-                                    if (canRenderRemote) {
-                                        return (
+                            {/* ✅ Small Preview - Swaps between local and remote based on streamsSwapped state */}
+                            <TouchableOpacity 
+                                activeOpacity={0.8}
+                                onPress={() => setStreamsSwapped(!streamsSwapped)}
+                                style={{
+                                    position: 'absolute',
+                                    top: insets.top + 10 + 44 + 20,
+                                    right: 20,
+                                    width: windowWidth * 0.3,
+                                    height: windowWidth * 0.45,
+                                    backgroundColor: '#000',
+                                    borderRadius: 10,
+                                    overflow: 'hidden',
+                                    zIndex: 10,
+                                    justifyContent: 'center',
+                                    alignItems: 'center',
+                                }}
+                            >
+                                {!streamsSwapped ? (
+                                    <>
+                                        {/* Local video small preview */}
+                                        {video ? (
                                             <RTCView
-                                                key={`remote-small-${remoteStream.id}-${remoteStreamTracksCount}`}
-                                                streamURL={remoteStream.toURL()}
+                                                streamURL={localStream?.toURL()}
                                                 objectFit="cover"
                                                 style={{ width: '100%', height: '100%' }}
-                                                mirror={false}
+                                                mirror={true}
                                             />
-                                        );
-                                    }
-                                    const statusText = remoteVideoMuted ? 'Video off' : 'Connecting…';
-                                    return (
-                                    <View style={{
-                                        ...StyleSheet.absoluteFillObject,
-                                        backgroundColor: '#111',
-                                        justifyContent: 'center',
-                                        alignItems: 'center',
-                                    }}>
-                                        <Avatar.Image size={60} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
-                                        <Text style={{ color: 'white', marginTop: 8, fontSize: 12 }}>
-                                            {firstName && lastName 
-                                                ? `${firstName} ${lastName}`
-                                                : name}
-                                        </Text>
-                                        <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 2, fontSize: 11 }}>
-                                            {statusText}
-                                        </Text>
-                    </View>
-                                    );
-                                })()}
-                            </>
-                        )}
-                    </TouchableOpacity>
+                                        ) : (
+                                            <View style={{
+                                                ...StyleSheet.absoluteFillObject,
+                                                backgroundColor: 'rgba(255,255,255,0.5)',
+                                                justifyContent: 'center',
+                                                alignItems: 'center',
+                                            }}>
+                                                <Feather name="video-off" size={28} color="#444" />
+                                            </View>
+                                        )}
+
+                                        {video && !mic && (
+                                            <View style={{
+                                                position: 'absolute',
+                                                bottom: 6,
+                                                alignSelf: 'center',
+                                                backgroundColor: 'rgba(0,0,0,0.6)',
+                                                padding: 4,
+                                                borderRadius: 20,
+                                            }}>
+                                                <Feather name="mic-off" size={20} color="white" />
+                                            </View>
+                                        )}
+                                    </>
+                                ) : (
+                                    <>
+                                        {/* Remote video small preview */}
+                                        {(() => {
+                                            const hasRemoteVideoTrack = !!remoteStream && (remoteStream.getVideoTracks?.()?.length || 0) > 0;
+                                            const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
+                                            if (canRenderRemote) {
+                                                return (
+                                                    <RTCView
+                                                        key={`remote-small-${remoteStream.id}-${remoteStreamTracksCount}`}
+                                                        streamURL={remoteStream.toURL()}
+                                                        objectFit="cover"
+                                                        style={{ width: '100%', height: '100%' }}
+                                                        mirror={false}
+                                                    />
+                                                );
+                                            }
+                                            const statusText = remoteVideoMuted ? 'Video off' : 'Connecting…';
+                                            return (
+                                                <View style={{
+                                                    ...StyleSheet.absoluteFillObject,
+                                                    backgroundColor: '#111',
+                                                    justifyContent: 'center',
+                                                    alignItems: 'center',
+                                                }}>
+                                                    <Avatar.Image size={60} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
+                                                    <Text style={{ color: 'white', marginTop: 8, fontSize: 12 }}>
+                                                        {firstName && lastName 
+                                                            ? `${firstName} ${lastName}`
+                                                            : name}
+                                                    </Text>
+                                                    <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 2, fontSize: 11 }}>
+                                                        {statusText}
+                                                    </Text>
+                                                </View>
+                                            );
+                                        })()}
+                                    </>
+                                )}
+                            </TouchableOpacity>
+                        </>
+                    ) : (
+                        <>
+                            {/* Audio call fallback (1:1) */}
+                            <View style={{ ...StyleSheet.absoluteFill, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgb(46,49,61)' }}>
+                                <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
+                                <Text style={{ fontSize: 22, fontWeight: 'bold', color: 'white', marginTop: 20 }}>{name}</Text>
+                                <Text style={{ fontSize: 16, color: 'white', marginTop: 10 }}>Audio Call</Text>
+                            </View>
                         </>
                     )}
-                </>
-            ) : (
-                <>
-                    {/* Audio call fallback */}
-                    <View style={{ ...StyleSheet.absoluteFill, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgb(46,49,61)' }}>
-                        <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
-                        <Text style={{ fontSize: 22, fontWeight: 'bold', color: 'white', marginTop: 20 }}>{name}</Text>
-                        <Text style={{ fontSize: 16, color: 'white', marginTop: 10 }}>Audio Call</Text>
-                    </View>
                 </>
             )}
 
@@ -831,19 +986,21 @@ const VideoCall = ({navigation}) => {
                 )}
                 <View style={styles.pillBottom}>
                 
-                <TouchableOpacity onPress={toggleVideo}>
-                    <Avatar.Icon
-                    size={44}
-                    style={video ? styles.circle : styles.circle_disabled}
-                    icon={() =>
-                        video ? (
-                        <Ionicons name="videocam-outline" size={24} color="black" />
-                        ) : (
-                        <Feather name="video-off" size={20} color="white" />
-                        )
-                    }
-                    />
-                </TouchableOpacity>
+                {info?.type === 'video' && (
+                    <TouchableOpacity onPress={toggleVideo}>
+                        <Avatar.Icon
+                        size={44}
+                        style={video ? styles.circle : styles.circle_disabled}
+                        icon={() =>
+                            video ? (
+                            <Ionicons name="videocam-outline" size={24} color="black" />
+                            ) : (
+                            <Feather name="video-off" size={20} color="white" />
+                            )
+                        }
+                        />
+                    </TouchableOpacity>
+                )}
                 <TouchableOpacity onPress={toggleAudio}>
                     <Avatar.Icon
                     size={44}
@@ -1037,17 +1194,21 @@ const VideoCall = ({navigation}) => {
                                         contact.server_info?.id !== user?.data?.id &&
                                         // Exclude current user by phone number (if they have their own number saved)
                                         contact.server_info?.phone !== user?.data?.phone &&
-                                        // Exclude call partner (the other person already in the call)
-                                        contact.server_info?.id !== info?.id &&
                                         (!searchText || contact.item?.name?.toLowerCase().includes(searchText.toLowerCase()))
                                     )
                                     .map((contact, index) => {
-                                        const isAdding = addingMembers.find(i => i.id === contact.server_info.id);
+                                        const contactIdStr = contact?.server_info?.id?.toString?.() ?? String(contact?.server_info?.id);
+                                        const isInCall = !!contactIdStr && inCallIdSet.has(contactIdStr);
+                                        const disabledRow = isAddingMembersToCall || isInCall;
                                         return (
                                             <Pressable
                                                 key={index}
                                                 style={styles.contactItemAdd}
-                                                onPress={() => handleAddContact(contact)}
+                                                disabled={disabledRow}
+                                                onPress={() => {
+                                                    if (disabledRow) return;
+                                                    addSingleToCall(contact);
+                                                }}
                                             >
                                                 <View style={styles.contactItemContent}>
                                                     <View style={{ height: 50, width: 50, borderRadius: 25, overflow: 'hidden', backgroundColor: 'rgb(146,146,143)' }}>
@@ -1062,12 +1223,22 @@ const VideoCall = ({navigation}) => {
                                                         </Text>
                                                     </View>
                                                     <TouchableOpacity
-                                                        onPress={() => handleAddContact(contact)}
+                                                        onPress={() => {
+                                                            if (disabledRow) return;
+                                                            addSingleToCall(contact);
+                                                        }}
                                                         style={{ paddingHorizontal: 12, paddingVertical: 6 }}
+                                                        disabled={disabledRow}
                                                     >
-                                                        <Text style={{ color: isAdding ? 'grey' : 'rgb(251,138,57)', fontSize: 14, fontWeight: '500' }}>
-                                                            {isAdding ? 'Adding...' : '+ Add'}
-                                                        </Text>
+                                                        {isInCall ? (
+                                                            <Text style={{ color: 'rgba(255,255,255,0.65)', fontSize: 14, fontStyle: 'italic' }}>
+                                                                In Call
+                                                            </Text>
+                                                        ) : (
+                                                            <Text style={{ color: isAddingMembersToCall ? 'grey' : 'rgb(251,138,57)', fontSize: 14, fontWeight: '500' }}>
+                                                                {isAddingMembersToCall ? 'Adding…' : '+ Add'}
+                                                            </Text>
+                                                        )}
                                                     </TouchableOpacity>
                                                 </View>
                                             </Pressable>
@@ -1085,12 +1256,9 @@ const VideoCall = ({navigation}) => {
                 onClose={() => setEmojiPicker(false)} 
                 onEmojiSelected={(emoji) => {
                     console.log('📱 Emoji selected:', emoji.emoji);
-                    setSelectedEmoji(emoji.emoji);
                     setEmojiPicker(false);
-                    // Auto-hide emoji after 3 seconds
-                    setTimeout(() => {
-                        setSelectedEmoji(null);
-                    }, 3000);
+                    // Broadcast to everyone (and show locally) for 30s.
+                    sendReaction(emoji.emoji);
                 }}
                 enableSearchBar
                 enableRecentlyUsed
@@ -1228,12 +1396,12 @@ const styles = StyleSheet.create({
     participantContainer: {
         borderRadius: 12,
         overflow: 'hidden',
-        backgroundColor: '#0B0B0F',
+        backgroundColor: 'rgba(70,70,70,0.3)', // Greyish background like 1:1 calls
     },
     videoOffFallback: {
         justifyContent: 'center',
         alignItems: 'center',
-        backgroundColor: '#0B0B0F',
+        backgroundColor: 'rgba(70,70,70,0.3)', // Greyish background like 1:1 calls
     },
     participantNameFallback: {
         marginTop: 10,

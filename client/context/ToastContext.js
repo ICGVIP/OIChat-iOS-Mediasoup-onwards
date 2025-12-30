@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 import { Portal, Snackbar } from 'react-native-paper';
+import { Text } from 'react-native';
 
 const ToastContext = createContext();
 
@@ -9,6 +10,10 @@ const DURATIONS = {
   LONG: 3500,
 };
 
+// Visuals (keep consistent across light/dark modes)
+const TOAST_BG = 'rgb(11,11,11)';
+const TOAST_TEXT = 'rgba(255,255,255,0.85)'; // whitish-gray
+
 // Global reference to the toast show function
 let globalToastShow = null;
 
@@ -17,7 +22,7 @@ export const ToastProvider = ({ children }) => {
   const [message, setMessage] = useState('');
   const [duration, setDuration] = useState(DURATIONS.SHORT);
   const [action, setAction] = useState(null);
-  const [backgroundColor, setBackgroundColor] = useState('rgb(11,11,11)');
+  const [backgroundColor, setBackgroundColor] = useState(TOAST_BG);
 
   const show = useCallback((msg, options = {}) => {
     setMessage(msg);
@@ -39,12 +44,8 @@ export const ToastProvider = ({ children }) => {
       setAction(null);
     }
     
-    // Handle backgroundColor if provided, otherwise use default
-    if (options.backgroundColor) {
-      setBackgroundColor(options.backgroundColor);
-    } else {
-      setBackgroundColor('rgb(11,11,11)');
-    }
+    // Always keep toast background black regardless of theme/options
+    setBackgroundColor(TOAST_BG);
     
     // Note: position, shadow, animation, hideOnPress are ignored
     // as react-native-paper Snackbar doesn't support these options
@@ -75,7 +76,9 @@ export const ToastProvider = ({ children }) => {
           action={action}
           style={{ backgroundColor }}
         >
-          {message}
+          <Text style={{ color: TOAST_TEXT }}>
+            {message}
+          </Text>
         </Snackbar>
       </Portal>
     </ToastContext.Provider>

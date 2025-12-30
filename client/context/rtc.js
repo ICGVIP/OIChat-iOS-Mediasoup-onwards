@@ -11,7 +11,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform, AppState, Alert } from 'react-native';
 import { useSelector } from 'react-redux';
 import uuid from 'react-native-uuid';
-import { navigate } from '../utils/staticNavigationutils';
+import { navigate, popToTop } from '../utils/staticNavigationutils';
 import { ParticipantManager } from './participantManager';
 import { SoundManager } from './soundManager';
 import { StreamManager } from './streamManager';
@@ -81,6 +81,8 @@ export const RTCProvider = ({ children }) => {
   const consumingProducerIdsRef = useRef(new Set()); // Prevent duplicate consume() calls per producerId
   const pendingProducerQueueRef = useRef([]); // Queue new-producer events until recvTransport exists
   const callModeRef = useRef({ isGroupCall: false }); // Avoid relying on React state inside socket handlers
+  // Map of { [userIdStr]: { firstName, lastName, username } } from calls server for non-contact name fallback.
+  const participantsInfoRef = useRef({});
   const callUUID = useRef(null);
   const incomingCallSetupComplete = useRef(null); // Promise resolver for app-killed scenario
   const incomingCallSetupPromise = useRef(null); // Promise that resolves when setup is complete
@@ -88,8 +90,11 @@ export const RTCProvider = ({ children }) => {
   const audioSessionStartedRef = useRef(false);
   const acceptInProgressRef = useRef(false);
   const acceptedCallIdRef = useRef(null);
+  const acceptSucceededCallIdRef = useRef(null); // set immediately after accept-call success (before join-call)
   const callKeepActiveMarkedRef = useRef(false);
   const callKeepAnsweredRef = useRef(false);
+  const lastIncomingCallRef = useRef(null); // { callId, fromUserId, callType, participants, rtpCapabilities, receivedAt }
+  const socketRegisteredRef = useRef(false);
 
 
   const iceServers = [
@@ -130,7 +135,17 @@ export const RTCProvider = ({ children }) => {
 
     socket.current.on('connect', async () => {
       rtcDbg('socket.connect', { socketId: socket.current?.id, userId: user?.data?.id });
-      socket.current.emit('register', user.data.id);
+      socketRegisteredRef.current = false;
+      socket.current.emit('register', user.data.id, (res) => {
+        socketRegisteredRef.current = !!res?.success;
+        rtcDbg('socket.register.ack', { res, socketRegistered: socketRegisteredRef.current });
+        // If CallKeep is waiting, register ack is a strong signal we're ready to accept.
+        if (incomingCallSetupComplete.current && currentCallId.current && incomingCallSetupCallId.current === currentCallId.current) {
+          try { incomingCallSetupComplete.current(); } catch {}
+          incomingCallSetupComplete.current = null;
+          incomingCallSetupPromise.current = null;
+        }
+      });
       rtcDbg('socket.register.emit', { userId: user?.data?.id });
       // Check AsyncStorage for pending call (app-killed scenario)
       // This ensures info.callId is available immediately, even before 'incoming-call' event fires
@@ -138,6 +153,13 @@ export const RTCProvider = ({ children }) => {
         const callDataStr = await AsyncStorage.getItem('incomingCallData');
         if (callDataStr) {
           const callData = JSON.parse(callDataStr);
+          rtcDbg('socket.connect.incomingCallData.found', {
+            callId: callData?.callId,
+            callerId: callData?.callerId,
+            handle: callData?.handle,
+            hasUuid: !!callData?.uuid,
+            callType: callData?.callType,
+          });
           
           
           // Restore info state immediately so processAccept can use it
@@ -152,6 +174,13 @@ export const RTCProvider = ({ children }) => {
           
           // Also set currentCallId ref
           currentCallId.current = callData.callId;
+          // Mark incoming-call "setup" as ready for this callId (even if we never got the socket incoming-call yet).
+          incomingCallSetupCallId.current = callData.callId;
+          rtcDbg('incomingCallSetup.marked_from_storage', {
+            currentCallId: currentCallId.current,
+            incomingCallSetupCallId: incomingCallSetupCallId.current,
+            socketConnected: socket.current?.connected,
+          });
           
           // Restore UUID if available
           if (callData.uuid) {
@@ -159,6 +188,18 @@ export const RTCProvider = ({ children }) => {
             
           }
           
+          // If something (e.g., CallKeep answer handler) is waiting for call context + socket,
+          // unblock it as soon as we have a callId + socket connection.
+          if (incomingCallSetupComplete.current) {
+            rtcDbg('incomingCallSetup.resolve_from_storage_on_connect', {
+              currentCallId: currentCallId.current,
+              incomingCallSetupCallId: incomingCallSetupCallId.current,
+              socketConnected: socket.current?.connected,
+            });
+            try { incomingCallSetupComplete.current(); } catch {}
+            incomingCallSetupComplete.current = null;
+            incomingCallSetupPromise.current = null;
+          }
           
         }
       } catch (e) {
@@ -176,7 +217,7 @@ export const RTCProvider = ({ children }) => {
 
     /* ---------- INCOMING CALL ---------- */
     socket.current.on('incoming-call', async (data) => {
-      const { callId, fromUserId, callType, rtpCapabilities, participants } = data;
+      const { callId, fromUserId, callType, rtpCapabilities, participants, callerFirstName, callerLastName, participantsInfo } = data;
 
       rtcDbg('incoming-call', {
         callId,
@@ -186,10 +227,25 @@ export const RTCProvider = ({ children }) => {
         hasRtpCaps: !!rtpCapabilities,
       });
 
+      // Keep an in-memory copy for cold-start CallKeep answer races (state/AsyncStorage may not be ready yet).
+      lastIncomingCallRef.current = {
+        callId,
+        fromUserId,
+        callType,
+        participants,
+        rtpCapabilities,
+        receivedAt: Date.now(),
+      };
+
       // IDEMPOTENCY CHECK: If we already set up for this callId, skip duplicate setup
       // This prevents errors when server resends 'incoming-call' on reconnect
       if (incomingCallSetupCallId.current === callId) {
         
+        // Ensure currentCallId is set even if we early-return (CallKeep cold-start can race here).
+        if (!currentCallId.current) {
+          currentCallId.current = callId;
+        }
+
         // Still update info state and signal completion (in case promise is waiting)
         setInfo({ id: fromUserId, callId, type: callType, name: fromUserId.toString(), participants });
         if (incomingCallSetupComplete.current) {
@@ -227,6 +283,17 @@ export const RTCProvider = ({ children }) => {
         
       }
 
+      // Merge any server-provided participantsInfo into a ref so we can show names for non-contacts.
+      try {
+        const mergedInfo = {
+          ...(existingCallData?.participantsInfo || {}),
+          ...(participantsInfo || {}),
+        };
+        if (mergedInfo && typeof mergedInfo === 'object') {
+          participantsInfoRef.current = mergedInfo;
+        }
+      } catch (e) {}
+
       // Decide call mode & display name (group vs 1:1)
       const participantList = Array.isArray(participants) ? participants : [fromUserId];
       const myIdStr = user?.data?.id?.toString?.();
@@ -236,11 +303,25 @@ export const RTCProvider = ({ children }) => {
 
       callModeRef.current.isGroupCall = otherIds.length > 1;
 
-      const lookupName = (idStr) => {
+      const lookupName = (idStr, serverFirstName = null, serverLastName = null) => {
         const c = contacts?.find?.(ct => ct?.isRegistered && ct?.server_info?.id?.toString?.() === idStr);
-        const first = c?.item?.firstName || '';
-        const last = c?.item?.lastName || '';
-        return `${first} ${last}`.trim() || c?.item?.name || idStr;
+        if (c?.item) {
+          const first = c.item.firstName || '';
+          const last = c.item.lastName || '';
+          return `${first} ${last}`.trim() || c.item.name || 'Unknown';
+        }
+        // Fallback to server-provided firstName/lastName if not in contacts
+        if (serverFirstName || serverLastName) {
+          return `${serverFirstName || ''} ${serverLastName || ''}`.trim() || 'Unknown';
+        }
+        // Fallback to participantsInfo (server-provided per-user info)
+        try {
+          const pi = participantsInfoRef.current?.[idStr];
+          const full = `${pi?.firstName || ''} ${pi?.lastName || ''}`.trim();
+          return full || pi?.username || 'Unknown';
+        } catch (e) {
+          return 'Unknown';
+        }
       };
 
       const formatGroupName = (ids) => {
@@ -249,14 +330,23 @@ export const RTCProvider = ({ children }) => {
         return `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
       };
 
-      // Get caller name - prioritize VoIP push data, then participants-based group name, then contacts, then fallback
+      // Get caller name - prioritize VoIP push data, then server firstName/lastName from socket event, then participants-based group name, then contacts, then fallback
+      // Use firstName/lastName from socket event if available (more recent than AsyncStorage)
+      const serverFirst = callerFirstName || existingCallData?.callerFirstName || null;
+      const serverLast = callerLastName || existingCallData?.callerLastName || null;
+      
       let callerName = fromUserId.toString();
       if (existingCallData?.callerName) {
         // Use name from VoIP push if available
         callerName = existingCallData.callerName;
         
       } else if (otherIds.length > 1) {
-        callerName = formatGroupName(otherIds);
+        // For group calls, use server firstName/lastName if available for each participant
+        const names = otherIds.map(idStr => {
+          // Use server firstName/lastName for the caller (fromUserId), contacts for others
+          return lookupName(idStr, idStr === fromUserId.toString() ? serverFirst : null, idStr === fromUserId.toString() ? serverLast : null);
+        });
+        callerName = names.length <= 2 ? names.join(' & ') : `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
         
       } else if (contacts && contacts.length > 0) {
         // Fallback to contacts lookup
@@ -267,7 +357,16 @@ export const RTCProvider = ({ children }) => {
           const firstName = contact.item.firstName || '';
           const lastName = contact.item.lastName || '';
           callerName = `${firstName} ${lastName}`.trim() || contact.item.name || callerName;
-          
+        } else {
+          // Not in contacts - use server firstName/lastName if available
+          if (serverFirst || serverLast) {
+            callerName = `${serverFirst || ''} ${serverLast || ''}`.trim() || callerName;
+          }
+        }
+      } else {
+        // No contacts at all - use server firstName/lastName if available
+        if (serverFirst || serverLast) {
+          callerName = `${serverFirst || ''} ${serverLast || ''}`.trim() || callerName;
         }
       }
 
@@ -277,7 +376,16 @@ export const RTCProvider = ({ children }) => {
 
       // Update info state (may have been pre-populated from AsyncStorage on connect)
       // This ensures we have the latest data from server
-      setInfo({ id: fromUserId, callId, type: callType, name: callerName, participants: participantList });
+      setInfo({
+        id: fromUserId,
+        callId,
+        type: callType,
+        name: callerName,
+        participants: participantList,
+        ...(participantsInfoRef.current ? { participantsInfo: participantsInfoRef.current } : {}),
+        ...(callerFirstName ? { callerFirstName } : {}),
+        ...(callerLastName ? { callerLastName } : {}),
+      });
       navigate('Incoming Call');
       
       // Ensure currentCallId is set (may have been set from AsyncStorage)
@@ -294,7 +402,10 @@ export const RTCProvider = ({ children }) => {
         callerName,
         participants: participantList,
         rtpCapabilities,
-        ...(existingCallData || {}), // Preserve any VoIP push data
+        ...(participantsInfoRef.current ? { participantsInfo: participantsInfoRef.current } : {}),
+        ...(callerFirstName ? { callerFirstName } : {}),
+        ...(callerLastName ? { callerLastName } : {}),
+        ...(existingCallData || {}), // Preserve any VoIP push data (may override with more recent socket data)
       };
       await AsyncStorage.setItem('incomingCallData', JSON.stringify(callData));
       
@@ -321,7 +432,8 @@ export const RTCProvider = ({ children }) => {
       } catch (e) {
         console.error('❌ [RTC] Error displaying CallKeep UI:', e);
         // Fallback: Show IncomingCall screen if CallKeep fails
-        InCallManager.startRingtone();
+        // InCallManager incoming ringtone disabled (CallKeep handles ringing)
+        // InCallManager.startRingtone();
         setTimeout(() => {
           navigate('Incoming Call');
         }, 100);
@@ -411,8 +523,11 @@ export const RTCProvider = ({ children }) => {
     });
 
     /* ---------- PARTICIPANT JOINED ---------- */
-    socket.current.on('participant-joined', ({ callId, userId }) => {
+    socket.current.on('participant-joined', ({ callId, userId, initial }) => {
       if (callId !== currentCallId.current) return;
+      
+      // Stop any outgoing ringback as soon as anyone actually joins.
+      try { InCallManager.stopRingback(); } catch (e) {}
       
       
       
@@ -420,16 +535,169 @@ export const RTCProvider = ({ children }) => {
       const userIds = Array.isArray(userId) ? userId : [userId];
       
       userIds.forEach(uid => {
-        const contact = contacts.find(c => 
+        markParticipantJoined(uid, { suppressSound: !!initial });
+      });
+    });
+
+    /* ---------- PARTICIPANT INVITED (mid-call add, show "Ringing…") ---------- */
+    socket.current.on('participant-invited', ({ callId, userIds, byUserId, userInfo }) => {
+      if (callId !== currentCallId.current) return;
+      const ids = Array.isArray(userIds) ? userIds : (userIds != null ? [userIds] : []);
+      if (!ids.length) return;
+
+      // If we are currently in a 1:1 call UI, upgrading to group can cause the existing remote tile
+      // to show "Connecting…" because 1:1 uses `remoteStream` while group uses ParticipantManager streams.
+      // Fix: seed ParticipantManager with local + existing remote and copy the already-established remoteStream in.
+      if (!callModeRef.current.isGroupCall) {
+        try {
+          const myIdStr = user?.data?.id?.toString?.() ?? (user?.data?.id != null ? String(user.data.id) : null);
+          const existingOtherIdStr =
+            info?.id?.toString?.() ??
+            participantManager.current?.getParticipantsList?.()?.find?.((p) => !p?.isLocal)?.userId ??
+            null;
+
+          const pmCount = participantManager.current?.getParticipantCount?.() || 0;
+          // Ensure we have local + existing remote in the manager (idempotent enough for this use)
+          if (existingOtherIdStr && pmCount < 2) {
+            participantManager.current.initializeParticipants([existingOtherIdStr], user, localStream, contacts, true);
+          }
+
+          // Carry over the already-established 1:1 remote stream into the participant entry.
+          // IMPORTANT: do NOT use React state `remoteStream` here (socket handlers run with stale closures).
+          // Use `remoteStreamRef.current` (kept current by consume()).
+          const establishedRemoteStream =
+            remoteStreamRef.current ||
+            participantManager.current?.getParticipant?.(existingOtherIdStr)?.stream ||
+            streamManager.current?.getParticipantStream?.(existingOtherIdStr) ||
+            null;
+          if (existingOtherIdStr && establishedRemoteStream) {
+            const prevP = participantManager.current?.getParticipant?.(existingOtherIdStr);
+            const nextStreamKey = (prevP?.streamKey || 0) + 1;
+            participantManager.current.updateParticipant(existingOtherIdStr, {
+              stream: establishedRemoteStream,
+              streamKey: nextStreamKey, // force tile remount
+              callStatus: 'joined',
+            });
+            // Best-effort copy mute state from current React state.
+            // (Mute UI correctness is secondary here; the main goal is to preserve the video stream.)
+            try { participantManager.current.updateParticipantMute(existingOtherIdStr, 'audio', !!remoteMicMuted); } catch {}
+            try { participantManager.current.updateParticipantMute(existingOtherIdStr, 'video', !!remoteVideoMuted); } catch {}
+          }
+
+          callModeRef.current.isGroupCall = true;
+
+          const seeded = participantManager.current.getParticipantsList();
+          setParticipantsList([...seeded]);
+          setCallInfo((prev) => ({
+            ...(prev || {}),
+            participantCount: Math.max(prev?.participantCount || 0, (participantManager.current.getParticipantCount?.() || seeded.length) + ids.length),
+          }));
+
+          // Keep info.participants in sync so other screens/fallbacks don't keep a stale group label.
+          setInfo((prev) => {
+            const prevArr = Array.isArray(prev?.participants)
+              ? prev.participants
+              : (myIdStr && existingOtherIdStr ? [myIdStr, existingOtherIdStr] : []);
+            const uniq = new Set(prevArr.map((x) => x?.toString?.() ?? String(x)));
+            ids.forEach((x) => uniq.add(x?.toString?.() ?? String(x)));
+            uniq.delete('');
+            uniq.delete('undefined');
+            uniq.delete('null');
+            return { ...(prev || {}), participants: Array.from(uniq) };
+          });
+
+          rtcDbg('participant-invited.upgradeToGroup', {
+            callId,
+            existingOtherIdStr,
+            addedIds: ids.map((x) => x?.toString?.() ?? String(x)),
+            seededParticipants: participantManager.current.getParticipantsList().map((p) => ({ userId: p.userId, isLocal: p.isLocal, callStatus: p.callStatus, hasStream: !!p.stream })),
+          });
+        } catch (e) {
+          rtcDbg('participant-invited.upgradeToGroup.error', { error: e?.message || String(e) });
+        }
+      }
+
+      ids.forEach(uid => {
+        const uidStr = uid?.toString?.() ?? String(uid);
+        // Merge server-provided info for this invited user (if present).
+        try {
+          if (userInfo && typeof userInfo === 'object') {
+            participantsInfoRef.current = { ...(participantsInfoRef.current || {}), [uidStr]: userInfo };
+          }
+        } catch (e) {}
+
+        const contact = contacts.find(c =>
           c.server_info?.id === uid || c.server_info?.id === parseInt(uid)
         );
+        const firstName = contact?.item?.firstName || null;
+        const lastName = contact?.item?.lastName || null;
+        const server = participantsInfoRef.current?.[uidStr] || null;
+        const serverFull = `${server?.firstName || ''} ${server?.lastName || ''}`.trim();
+        const name =
+          contact?.item?.name ||
+          (firstName || lastName ? `${firstName || ''} ${lastName || ''}`.trim() : null) ||
+          serverFull ||
+          server?.username ||
+          'Unknown';
         addParticipant(uid, {
-          name: contact?.item?.name || contact?.item?.firstName || 'Unknown',
+          name,
+          firstName,
+          lastName,
+          username: server?.username || null,
           avatar: contact?.server_info?.avatar,
           isLocal: false,
+          stream: null, // triggers "Ringing…" in VideoCall
+          callStatus: 'invited',
+          suppressSound: true,
+          invitedBy: byUserId,
         });
-        
       });
+    });
+
+    /* ---------- PARTICIPANT NO ANSWER (invite timed out) ---------- */
+    socket.current.on('participant-no-answer', ({ callId, userId }) => {
+      if (callId !== currentCallId.current) return;
+      if (userId == null) return;
+      removeParticipant(userId);
+    });
+
+    /* ---------- CALL EXPIRED (invitee-side timeout) ---------- */
+    socket.current.on('call-expired', async ({ callId }) => {
+      try {
+        if (!callId) return;
+        // If we already accepted/joined and have transports, ignore.
+        if (acceptedCallIdRef.current === callId) return;
+        if (sendTransport.current || recvTransport.current) return;
+        if (currentCallId.current && currentCallId.current !== callId) return;
+
+        // Stop ringing UIs without ending the whole call for others.
+        try { InCallManager.stopRingtone(); } catch (e) {}
+        try { InCallManager.stopRingback(); } catch (e) {}
+
+        if (callUUID.current) {
+          try { RNCallKeep.endCall(callUUID.current); } catch (e) {}
+          callUUID.current = null;
+        }
+
+        // Clear stored invite if it matches.
+        try {
+          const saved = await AsyncStorage.getItem('incomingCallData');
+          if (saved) {
+            const parsed = JSON.parse(saved);
+            if (parsed?.callId === callId) {
+              await AsyncStorage.removeItem('incomingCallData');
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+
+        currentCallId.current = null;
+        setInfo({});
+        popToTop();
+      } catch (e) {
+        // ignore
+      }
     });
 
     /* ---------- PARTICIPANT LEFT ---------- */
@@ -440,7 +708,8 @@ export const RTCProvider = ({ children }) => {
 
     /* ---------- CALL ENDED ---------- */
     socket.current.on('call-ended', () => {
-      endCall();
+      // Don't emit "leave/end" back to server; server initiated this.
+      endCall({ emitToServer: false });
     });
 
     /* ---------- REMOTE USER MUTED/UNMUTED ---------- */
@@ -451,8 +720,11 @@ export const RTCProvider = ({ children }) => {
           
           updateParticipantMute(userId, 'audio', true);
         } else {
-          
-          setRemoteMicMuted(true);
+          // 1:1: only apply mute state for the currently displayed remote user
+          const targetId = info?.id?.toString?.() ?? null;
+          if (!targetId || targetId === userId?.toString?.()) {
+            setRemoteMicMuted(true);
+          }
         }
       } else {
         
@@ -466,8 +738,10 @@ export const RTCProvider = ({ children }) => {
           
           updateParticipantMute(userId, 'audio', false);
         } else {
-          
-          setRemoteMicMuted(false);
+          const targetId = info?.id?.toString?.() ?? null;
+          if (!targetId || targetId === userId?.toString?.()) {
+            setRemoteMicMuted(false);
+          }
         }
       } else {
         
@@ -482,8 +756,10 @@ export const RTCProvider = ({ children }) => {
           
           updateParticipantMute(userId, 'video', true);
         } else {
-          
-          setRemoteVideoMuted(true);
+          const targetId = info?.id?.toString?.() ?? null;
+          if (!targetId || targetId === userId?.toString?.()) {
+            setRemoteVideoMuted(true);
+          }
         }
       } else {
         
@@ -497,8 +773,10 @@ export const RTCProvider = ({ children }) => {
           
           updateParticipantMute(userId, 'video', false);
         } else {
-          
-          setRemoteVideoMuted(false);
+          const targetId = info?.id?.toString?.() ?? null;
+          if (!targetId || targetId === userId?.toString?.()) {
+            setRemoteVideoMuted(false);
+          }
         }
       } else {
         
@@ -533,6 +811,13 @@ export const RTCProvider = ({ children }) => {
   // Initialize participants (only for group calls - 1:1 doesn't need this)
   // IMPORTANT: pass localStreamOverride when you have the fresh stream in-hand, because setLocalStream() is async.
   const initializeParticipants = (participantIds, includeLocal = false, localStreamOverride = null) => {
+    rtcDbg('initializeParticipants.start', {
+      participantIds,
+      participantIdsLength: participantIds?.length || 0,
+      includeLocal,
+      hasLocalStream: !!localStreamOverride || !!localStream,
+    });
+    
     const newList = participantManager.current.initializeParticipants(
       participantIds,
       user,
@@ -541,12 +826,114 @@ export const RTCProvider = ({ children }) => {
       includeLocal
     );
     
+    rtcDbg('initializeParticipants.afterManagerInit', {
+      newListLength: newList.length,
+      newListUserIds: newList.map(p => p.userId),
+    });
+    
+    // Default participant status:
+    // - local user: joined
+    // - remote users: invited (until we receive participant-joined for them)
+    try {
+      newList.forEach((p) => {
+        if (!p?.userId) return;
+        if (p.isLocal) {
+          participantManager.current.updateParticipant(p.userId, { callStatus: 'joined' });
+        } else {
+          participantManager.current.updateParticipant(p.userId, { callStatus: p.callStatus || 'invited' });
+        }
+      });
+    } catch (e) {
+      rtcDbg('initializeParticipants.statusUpdateError', { error: e?.message || e });
+    }
+
+    // Hydrate remote participants with server-provided names when they're not in contacts.
+    // ParticipantManager.initializeParticipants() only knows about phone contacts, so without this
+    // non-contacts would show as "Unknown" in group tiles.
+    try {
+      (Array.isArray(newList) ? newList : []).forEach((p) => {
+        if (!p?.userId || p?.isLocal) return;
+        const idStr = p.userId?.toString?.() ?? String(p.userId);
+        const pi = participantsInfoRef.current?.[idStr] || null;
+        if (!pi) return;
+
+        const full = `${pi.firstName || ''} ${pi.lastName || ''}`.trim();
+        // Only overwrite if current name is missing/unknown/id-like.
+        const nameLooksBad =
+          !p.name ||
+          p.name === 'Unknown' ||
+          p.name === idStr;
+        if (nameLooksBad) {
+          participantManager.current.updateParticipant(idStr, {
+            firstName: pi.firstName || p.firstName || null,
+            lastName: pi.lastName || p.lastName || null,
+            username: pi.username || p.username || null,
+            name: full || pi.username || 'Unknown',
+          });
+        } else {
+          // Still stash username if we have it.
+          if (pi.username && !p.username) {
+            participantManager.current.updateParticipant(idStr, { username: pi.username });
+          }
+        }
+      });
+    } catch (e) {
+      rtcDbg('initializeParticipants.hydrateNamesError', { error: e?.message || String(e) });
+    }
+
+    const finalList = participantManager.current.getParticipantsList();
+    
+    rtcDbg('initializeParticipants.final', {
+      finalListLength: finalList.length,
+      finalListUserIds: finalList.map(p => ({ userId: p.userId, callStatus: p.callStatus, isLocal: p.isLocal })),
+    });
+
     // Only set state if it's actually a group call (3+ participants)
-    // For 1:1 calls, we don't need participant state
-    if (newList.length > 2) {
+    // IMPORTANT: Also respect callModeRef.isGroupCall if it's already set (e.g., by processAccept)
+    // This ensures that if we have 3+ total participants (including ringing), we show group view
+    const shouldBeGroupCall = finalList.length > 2 || callModeRef.current.isGroupCall;
+    
+    if (shouldBeGroupCall) {
       callModeRef.current.isGroupCall = true;
-      setParticipantsList(newList);
-      setCallInfo(prev => ({ ...prev, participantCount: newList.length }));
+      // IMPORTANT: Only update state if it's not already set (to avoid overwriting processAccept's state)
+      // Check if participantsList is already populated - if so, merge/update instead of replace
+      setParticipantsList(prevList => {
+        // If we already have participants, merge with new ones (preserve existing state)
+        if (prevList && prevList.length > 0) {
+          const merged = finalList.map(newP => {
+            const existing = prevList.find(p => p.userId === newP.userId);
+            // Preserve existing participant state (stream, callStatus) if it exists
+            return existing ? { ...newP, ...existing } : newP;
+          });
+          rtcDbg('initializeParticipants.mergeState', {
+            prevListLength: prevList.length,
+            finalListLength: finalList.length,
+            mergedLength: merged.length,
+            mergedUserIds: merged.map(p => p.userId),
+          });
+          return merged;
+        }
+        // Otherwise, set new list
+        rtcDbg('initializeParticipants.newState', {
+          finalListLength: finalList.length,
+          finalListUserIds: finalList.map(p => p.userId),
+        });
+        return [...finalList];
+      });
+      // Preserve existing participantCount if set (includes ringing participants), otherwise use finalList.length
+      setCallInfo(prev => {
+        const newCount = prev?.participantCount || finalList.length;
+        rtcDbg('initializeParticipants.setState', {
+          finalListLength: finalList.length,
+          finalListUserIds: finalList.map(p => p.userId),
+          participantCount: newCount,
+          prevParticipantCount: prev?.participantCount,
+        });
+        return { 
+          ...prev, 
+          participantCount: newCount 
+        };
+      });
     } else {
       // For 1:1, just initialize the manager but don't update state
       // This keeps the manager in sync but avoids unnecessary re-renders
@@ -554,18 +941,78 @@ export const RTCProvider = ({ children }) => {
     }
   };
 
+  const markParticipantJoined = (userId, { suppressSound = false } = {}) => {
+    const userIdStr = userId?.toString?.() ?? String(userId);
+    const existing = participantManager.current.getParticipant(userIdStr);
+    if (existing) {
+      participantManager.current.updateParticipant(userIdStr, { callStatus: 'joined' });
+      if (callModeRef.current.isGroupCall) {
+        setParticipantsList(participantManager.current.getParticipantsList());
+      }
+      return;
+    }
+
+    const contact = contacts.find(c =>
+      c.server_info?.id === userId || c.server_info?.id === parseInt(userId)
+    );
+    const server = participantsInfoRef.current?.[userIdStr] || null;
+    const serverFull = `${server?.firstName || ''} ${server?.lastName || ''}`.trim();
+    addParticipant(userId, {
+      name: contact?.item?.name || contact?.item?.firstName || serverFull || server?.username || 'Unknown',
+      firstName: contact?.item?.firstName || server?.firstName || null,
+      lastName: contact?.item?.lastName || server?.lastName || null,
+      username: server?.username || null,
+      avatar: contact?.server_info?.avatar,
+      isLocal: false,
+      callStatus: 'joined',
+      suppressSound,
+    });
+  };
+
   // Add participant (only update state for group calls)
   const addParticipant = (userId, participantData) => {
-    const participant = participantManager.current.addParticipant(userId, participantData);
+    // If name is missing and we have firstName/lastName, construct name
+    let finalData = { ...participantData };
+    if (!finalData.name || finalData.name === 'Unknown' || finalData.name === userId?.toString()) {
+      const contact = contacts.find(c =>
+        c.isRegistered && (c.server_info?.id === userId || c.server_info?.id === parseInt(userId))
+      );
+      if (contact?.item) {
+        const first = contact.item.firstName || '';
+        const last = contact.item.lastName || '';
+        finalData.name = `${first} ${last}`.trim() || contact.item.name || 'Unknown';
+        finalData.firstName = contact.item.firstName || null;
+        finalData.lastName = contact.item.lastName || null;
+      } else if (participantsInfoRef.current?.[userId?.toString?.() ?? String(userId)]) {
+        const idStr = userId?.toString?.() ?? String(userId);
+        const pi = participantsInfoRef.current?.[idStr];
+        const full = `${pi?.firstName || ''} ${pi?.lastName || ''}`.trim();
+        finalData.firstName = pi?.firstName || finalData.firstName || null;
+        finalData.lastName = pi?.lastName || finalData.lastName || null;
+        finalData.username = pi?.username || finalData.username || null;
+        finalData.name = full || pi?.username || 'Unknown';
+      } else if (finalData.firstName || finalData.lastName) {
+        // Use server-provided firstName/lastName if available
+        finalData.name = `${finalData.firstName || ''} ${finalData.lastName || ''}`.trim() || finalData.username || 'Unknown';
+      } else {
+        // Last resort: never show raw userId.
+        finalData.name = finalData.username || 'Unknown';
+      }
+    }
+    
+    const participant = participantManager.current.addParticipant(userId, finalData);
     if (participant) {
       const currentCount = participantManager.current.getParticipantCount();
       // Only update state if it's a group call
       if (currentCount > 2) {
         callModeRef.current.isGroupCall = true;
-        setParticipantsList(prev => [...prev, participant]);
+        // IMPORTANT: Always derive list from ParticipantManager to avoid duplicates in React state.
+        setParticipantsList(participantManager.current.getParticipantsList());
         setCallInfo(prev => ({ ...prev, participantCount: currentCount }));
       }
-      soundManager.current.playJoinSound();
+      if (!participantData?.suppressSound) {
+        soundManager.current.playJoinSound();
+      }
     }
   };
 
@@ -589,11 +1036,49 @@ export const RTCProvider = ({ children }) => {
       const currentCount = participantManager.current.getParticipantCount();
       // Only update state if it's still a group call
       if (currentCount > 2) {
-        setParticipantsList(prev => prev.filter(p => p.userId !== userIdStr));
+        // IMPORTANT: Always derive list from ParticipantManager to avoid duplicates/stale state.
+        setParticipantsList(participantManager.current.getParticipantsList());
         setCallInfo(prev => ({ ...prev, participantCount: currentCount }));
         callModeRef.current.isGroupCall = true;
       } else {
+        // Dropped to 2 participants (me + 1). Switch UI to 1:1 *but* keep using the existing stream
+        // we already have for the remaining participant, otherwise VideoCall's big RTCView goes black.
+        const list = participantManager.current.getParticipantsList();
+        const remainingRemote = (list || []).find(p => !p.isLocal);
+
         callModeRef.current.isGroupCall = false;
+        setParticipantsList([]);
+        setCallInfo(prev => ({ ...prev, participantCount: currentCount }));
+
+        if (remainingRemote?.stream) {
+          try {
+            setRemoteStream(remainingRemote.stream);
+            // Force 1:1 RTCView refresh
+            setRemoteStreamTracksCount((n) => (typeof n === 'number' ? n + 1 : 1));
+            // Carry over mute status so 1:1 screen reflects it
+            setRemoteMicMuted(!!remainingRemote?.muted?.mic);
+            setRemoteVideoMuted(!!remainingRemote?.muted?.video);
+
+            // Update info to the remaining remote (prevents stale group labels like "Lucky & Moon is muted")
+            try {
+              const myIdStr = user?.data?.id?.toString?.() ?? (user?.data?.id != null ? String(user.data.id) : null);
+              const otherIdStr = remainingRemote?.userId?.toString?.() ?? null;
+              if (otherIdStr) {
+                setInfo(prev => ({
+                  ...(prev || {}),
+                  id: otherIdStr,
+                  name: remainingRemote?.name || otherIdStr,
+                  participants: [myIdStr, otherIdStr].filter(Boolean),
+                }));
+              }
+            } catch (e) {}
+          } catch (e) {
+            // ignore
+          }
+        } else {
+          // No remaining stream yet (they may still be connecting)
+          setRemoteStream(null);
+        }
       }
       soundManager.current.playLeaveSound();
     }
@@ -846,12 +1331,34 @@ export const RTCProvider = ({ children }) => {
         await audioProducer.resume();
         
         socket.current.emit('mute-audio', { callId: currentCallId.current, producerId: audioProducer.id, muted: false });
+        
+        // Update local participant mute status in group calls
+        if (callModeRef.current.isGroupCall && user?.data?.id) {
+          const myIdStr = user.data.id.toString();
+          participantManager.current.updateParticipantMute(myIdStr, 'audio', false);
+          setParticipantsList(participantManager.current.getParticipantsList());
+        }
+        
+        // Update micStatus state for UI consistency
+        setMicStatus(true);
+        
         return true; // Unmuted
       } else {
         // Pause producer (mute)
         await audioProducer.pause();
         
         socket.current.emit('mute-audio', { callId: currentCallId.current, producerId: audioProducer.id, muted: true });
+        
+        // Update local participant mute status in group calls
+        if (callModeRef.current.isGroupCall && user?.data?.id) {
+          const myIdStr = user.data.id.toString();
+          participantManager.current.updateParticipantMute(myIdStr, 'audio', true);
+          setParticipantsList(participantManager.current.getParticipantsList());
+        }
+        
+        // Update micStatus state for UI consistency
+        setMicStatus(false);
+        
         return false; // Muted
       }
     } catch (error) {
@@ -873,12 +1380,34 @@ export const RTCProvider = ({ children }) => {
         await videoProducer.resume();
         
         socket.current.emit('mute-video', { callId: currentCallId.current, producerId: videoProducer.id, muted: false });
+        
+        // Update local participant mute status in group calls
+        if (callModeRef.current.isGroupCall && user?.data?.id) {
+          const myIdStr = user.data.id.toString();
+          participantManager.current.updateParticipantMute(myIdStr, 'video', false);
+          setParticipantsList(participantManager.current.getParticipantsList());
+        }
+        
+        // Update videoStatus state for UI consistency
+        setVideoStatus(true);
+        
         return true; // Video on
       } else {
         // Pause producer (mute video)
         await videoProducer.pause();
         
         socket.current.emit('mute-video', { callId: currentCallId.current, producerId: videoProducer.id, muted: true });
+        
+        // Update local participant mute status in group calls
+        if (callModeRef.current.isGroupCall && user?.data?.id) {
+          const myIdStr = user.data.id.toString();
+          participantManager.current.updateParticipantMute(myIdStr, 'video', true);
+          setParticipantsList(participantManager.current.getParticipantsList());
+        }
+        
+        // Update videoStatus state for UI consistency
+        setVideoStatus(false);
+        
         return false; // Video off
       }
     } catch (error) {
@@ -915,8 +1444,13 @@ export const RTCProvider = ({ children }) => {
 
     const userIdStr = userId?.toString();
     
-    // Avoid relying on React state inside socket-driven code (can be stale)
-    const isGroupCall = !!callModeRef.current.isGroupCall;
+    // Avoid relying only on callModeRef (can be stale during late joins).
+    const participantCount = participantManager.current?.getParticipantCount?.() || 0;
+    const isGroupCall =
+      !!callModeRef.current.isGroupCall ||
+      participantCount > 2 ||
+      (Array.isArray(participantsList) && participantsList.length > 2) ||
+      (Array.isArray(info?.participants) && info.participants.length > 2);
 
     try {
       const data = await new Promise((resolve, reject) => {
@@ -981,6 +1515,34 @@ export const RTCProvider = ({ children }) => {
     
     
     if (track) {
+      // If we successfully received a track for this user, they are definitely "joined".
+      // This prevents "Ringing…" getting stuck if participant-joined signaling was missed/raced.
+      try {
+        const existingP = participantManager.current.getParticipant?.(userIdStr);
+        if (existingP) {
+          participantManager.current.updateParticipant(userIdStr, { callStatus: 'joined' });
+        } else if (isGroupCall) {
+          const contact = contacts.find(c =>
+            c.server_info?.id === userIdStr || c.server_info?.id === parseInt(userIdStr)
+          );
+          const server = participantsInfoRef.current?.[userIdStr] || null;
+          const serverFull = `${server?.firstName || ''} ${server?.lastName || ''}`.trim();
+          addParticipant(userIdStr, {
+            name: contact?.item?.name || contact?.item?.firstName || serverFull || server?.username || 'Unknown',
+            firstName: contact?.item?.firstName || server?.firstName || null,
+            lastName: contact?.item?.lastName || server?.lastName || null,
+            username: server?.username || null,
+            avatar: contact?.server_info?.avatar,
+            isLocal: false,
+            callStatus: 'joined',
+            suppressSound: true,
+          });
+        }
+        if (isGroupCall) {
+          setParticipantsList(participantManager.current.getParticipantsList());
+        }
+      } catch (e) {}
+
       const updatedParticipantStream = streamManager.current.addTrackToParticipantStream(userIdStr, track);
       rtcDbg('track.attached', {
         callId: currentCallId.current,
@@ -1240,12 +1802,31 @@ export const RTCProvider = ({ children }) => {
               });
 
             try {
-              await joinCall();
+              const joinRes = await joinCall();
+              try {
+                if (joinRes?.participantsInfo && typeof joinRes.participantsInfo === 'object') {
+                  participantsInfoRef.current = { ...(participantsInfoRef.current || {}), ...joinRes.participantsInfo };
+                }
+              } catch (e) {}
+
+              // IMPORTANT: set group mode early (before any consume happens) so late-join races don't route media into 1:1.
+              if (Array.isArray(participantIds) && participantIds.length > 1) {
+                callModeRef.current.isGroupCall = true;
+              }
+
               const recvTransportParams = await createTransport('recv');
               const sendTransportParams = await createTransport('send');
 
               await createRecvTransport(recvTransportParams);
               await createSendTransport(sendTransportParams);
+
+              // Initialize participants BEFORE producing/consuming to avoid 1:1 routing during negotiation.
+              if (participantIds.length > 1) {
+                initializeParticipants(participantIds, true, stream);
+                setCallInfo({ callId, type: callType, participantCount: participantIds.length + 1 });
+              } else {
+                participantManager.current.initializeParticipants(participantIds, user, stream, contacts, true);
+              }
 
               await produce(stream, callType);
 
@@ -1269,25 +1850,14 @@ export const RTCProvider = ({ children }) => {
               return;
             }
             
-
-            // Initialize participants (only update state for group calls)
-            
-            if (participantIds.length > 1) {
-              // Group call - initialize with state updates
-              initializeParticipants(participantIds, true, stream);
-              setCallInfo({ callId, type: callType, participantCount: participantIds.length + 1 });
-              
-            } else {
-              // 1:1 call - initialize manager silently (no state updates to avoid re-renders)
-              participantManager.current.initializeParticipants(participantIds, user, stream, contacts, true);
-              
-            }
+            // (participants are initialized earlier now)
             
             setInfo({ 
               id: participantIds.length === 1 ? participantIds[0] : null, // For 1:1 compatibility
               callId, 
               type: callType,
               participants: [user?.data?.id, ...participantIds].filter(Boolean),
+              ...(participantsInfoRef.current ? { participantsInfo: participantsInfoRef.current } : {}),
             });
             
             
@@ -1320,23 +1890,111 @@ export const RTCProvider = ({ children }) => {
       return;
     }
 
-    // Check max participants limit (10)
-    const currentCount = participantsList.length;
-    if (currentCount + participantIds.length > 10) {
+    const ids = Array.isArray(participantIds) ? participantIds : (participantIds != null ? [participantIds] : []);
+    if (!ids.length) return;
+
+    // Check max participants limit (10). Use ParticipantManager (participantsList can be empty in 1:1 mode).
+    const currentCount = participantManager.current?.getParticipantCount?.() || 0;
+    if (currentCount + ids.length > 10) {
       Alert.alert('Error', 'Maximum 10 participants allowed per call');
       return;
     }
 
+    // If this call started as 1:1, explicitly upgrade to group mode now so:
+    // - we can show the ringing tile immediately
+    // - consume() routes media into participant streams rather than 1:1 remoteStream
+    if (!callModeRef.current.isGroupCall) {
+      try {
+        const myIdStr = user?.data?.id?.toString?.() ?? (user?.data?.id != null ? String(user.data.id) : null);
+        const existingOtherIdStr =
+          info?.id?.toString?.() ??
+          participantManager.current?.getParticipantsList?.()?.find?.((p) => !p?.isLocal)?.userId ??
+          null;
+
+        // Ensure participantManager has local + existing remote before we add invitees.
+        // If it's already initialized, this call is idempotent (initializeParticipants would replace),
+        // so only run if we don't already have >= 2 participants.
+        const pmCount = participantManager.current?.getParticipantCount?.() || 0;
+        if (existingOtherIdStr && pmCount < 2) {
+          participantManager.current.initializeParticipants([existingOtherIdStr], user, localStream, contacts, true);
+        }
+
+        // Carry over the existing 1:1 remote stream into the participant entry so the caller tile doesn't go black
+        // when we switch to group view.
+        if (existingOtherIdStr && remoteStream) {
+          participantManager.current.updateParticipant(existingOtherIdStr, {
+            stream: remoteStream,
+            callStatus: 'joined',
+          });
+        }
+
+        callModeRef.current.isGroupCall = true;
+
+        // Seed group UI immediately (even before invite is acknowledged by server).
+        const seeded = participantManager.current.getParticipantsList();
+        setParticipantsList([...seeded]);
+        setCallInfo((prev) => ({ ...(prev || {}), participantCount: participantManager.current.getParticipantCount() || seeded.length }));
+
+        // Also keep info.participants in sync so future fallbacks know this is a group call.
+        setInfo((prev) => {
+          const prevArr = Array.isArray(prev?.participants) ? prev.participants : (myIdStr && existingOtherIdStr ? [myIdStr, existingOtherIdStr] : []);
+          const uniq = new Set(prevArr.map((x) => x?.toString?.() ?? String(x)));
+          ids.forEach((x) => uniq.add(x?.toString?.() ?? String(x)));
+          uniq.delete('');
+          uniq.delete('undefined');
+          uniq.delete('null');
+          return { ...(prev || {}), participants: Array.from(uniq) };
+        });
+
+        rtcDbg('addParticipantsToCall.upgradeToGroup', {
+          callId: currentCallId.current,
+          existingOtherIdStr,
+          addedIds: ids.map((x) => x?.toString?.() ?? String(x)),
+          participantsAfterSeed: participantManager.current.getParticipantsList().map((p) => ({ userId: p.userId, isLocal: p.isLocal, callStatus: p.callStatus })),
+        });
+      } catch (e) {
+        rtcDbg('addParticipantsToCall.upgradeToGroup.error', { error: e?.message || String(e) });
+      }
+    }
+
+    // Optimistically add ringing tiles immediately (server will also broadcast participant-invited to everyone).
+    ids.forEach(uid => {
+      const uidStr = uid?.toString?.() ?? String(uid);
+      const contact = contacts.find(c =>
+        c.server_info?.id === uid || c.server_info?.id === parseInt(uid)
+      );
+      const firstName = contact?.item?.firstName || null;
+      const lastName = contact?.item?.lastName || null;
+      const server = participantsInfoRef.current?.[uidStr] || null;
+      const serverFull = `${server?.firstName || ''} ${server?.lastName || ''}`.trim();
+      const name =
+        contact?.item?.name ||
+        (firstName || lastName ? `${firstName || ''} ${lastName || ''}`.trim() : null) ||
+        serverFull ||
+        server?.username ||
+        'Unknown';
+      addParticipant(uid, {
+        name,
+        firstName: firstName || server?.firstName || null,
+        lastName: lastName || server?.lastName || null,
+        username: server?.username || null,
+        avatar: contact?.server_info?.avatar,
+        isLocal: false,
+        stream: null,
+        callStatus: 'invited',
+        suppressSound: true,
+      });
+    });
+
     socket.current.emit(
       'add-participants',
-      { callId: currentCallId.current, participantIds },
+      { callId: currentCallId.current, participantIds: ids },
       (response) => {
         if (response.error) {
           console.error('❌ [RTC] Error adding participants:', response.error);
           Alert.alert('Error', 'Failed to add participants: ' + response.error);
         } else {
-          
-          // Participants will be added via 'participant-joined' event
+          // If server rejects/filters some users (already in call / max cap), it will still be reflected by join/no-answer events.
         }
       }
     );
@@ -1351,10 +2009,35 @@ export const RTCProvider = ({ children }) => {
       // ignore
     }
 
-    // Fallback: If info.callId is not available, try to get it from AsyncStorage
-    let callIdToUse = info.callId;
-    let userIdToUse = info.id;
-    let callTypeToUse = info.type;
+    // Cold-start reality:
+    // - React state (info) may not be populated yet when CallKeep answer fires.
+    // - AsyncStorage write from index.js / incoming-call handler may not have completed yet.
+    // So prefer refs and last socket 'incoming-call' snapshot first.
+    let callIdToUse =
+      info.callId ||
+      currentCallId.current ||
+      incomingCallSetupCallId.current ||
+      lastIncomingCallRef.current?.callId;
+    let userIdToUse =
+      info.id ||
+      lastIncomingCallRef.current?.fromUserId;
+    let callTypeToUse =
+      info.type ||
+      lastIncomingCallRef.current?.callType;
+    
+    rtcDbg('processAccept.start', {
+      source,
+      infoCallId: info?.callId,
+      infoUserId: info?.id,
+      infoType: info?.type,
+      currentCallId: currentCallId.current,
+      incomingCallSetupCallId: incomingCallSetupCallId.current,
+      socketConnected: socket.current?.connected,
+      hasDevice: !!device.current,
+      hasSendTransport: !!sendTransport.current,
+      hasRecvTransport: !!recvTransport.current,
+      time: Date.now(),
+    });
     
     if (!callIdToUse) {
       
@@ -1362,6 +2045,12 @@ export const RTCProvider = ({ children }) => {
         const callDataStr = await AsyncStorage.getItem('incomingCallData');
         if (callDataStr) {
           const callData = JSON.parse(callDataStr);
+          rtcDbg('processAccept.storage.found', {
+            callId: callData?.callId,
+            callerId: callData?.callerId,
+            handle: callData?.handle,
+            callType: callData?.callType,
+          });
           callIdToUse = callData.callId;
           userIdToUse = callData.callerId || callData.handle;
           callTypeToUse = callTypeToUse || callData.callType;
@@ -1384,7 +2073,9 @@ export const RTCProvider = ({ children }) => {
 
     if (!callIdToUse) {
       console.error('❌ [RTC] No callId available - cannot accept call');
-      return;
+      rtcDbg('processAccept.no_callId_abort', { source, currentCallId: currentCallId.current, socketConnected: socket.current?.connected });
+      // Throw so CallKeep answer handler can treat this as a failure and end the call gracefully.
+      throw new Error('No callId available - cannot accept call');
     }
 
     // Default to video if type is unknown (server typically sends it; AsyncStorage should have it too)
@@ -1419,19 +2110,30 @@ export const RTCProvider = ({ children }) => {
 
     // Mark call mode and callId refs early
     currentCallId.current = callIdToUse;
+    rtcDbg('processAccept.before_accept_call_emit', {
+      callId: callIdToUse,
+      fromUserId: userIdToUse,
+      callType: callTypeToUse,
+      socketConnected: socket.current?.connected,
+    });
 
     
 
     try {
-      socket.current.emit(
-        'accept-call',
-        { callId: callIdToUse, fromUserId: userIdToUse },
-        async (response) => {
-          if (response?.error) {
-            console.error('❌ [RTC] accept-call failed:', response.error);
-            acceptInProgressRef.current = false;
-            return;
-          }
+      await new Promise((resolve, reject) => {
+        socket.current.emit(
+          'accept-call',
+          { callId: callIdToUse, fromUserId: userIdToUse },
+          async (response) => {
+            try {
+              if (response?.error) {
+                console.error('❌ [RTC] accept-call failed:', response.error);
+                acceptInProgressRef.current = false;
+                return reject(new Error(response.error));
+              }
+
+              // Mark accept succeeded as soon as server confirms it.
+              acceptSucceededCallIdRef.current = callIdToUse;
 
         // Don't manually activate RTCAudioSession when CallKeep is active
         // CallKeep/AppDelegate handles audio session activation via CallKit
@@ -1445,25 +2147,13 @@ export const RTCProvider = ({ children }) => {
         //   }
         // }
 
-          // For CallKeep: do NOT call answerIncomingCall here (it can re-trigger answerCall loop).
-          // Just mark active once, if possible.
-          if (callUUID.current && !callKeepActiveMarkedRef.current) {
-            try {
-              RNCallKeep.setCurrentCallActive(callUUID.current);
-              callKeepActiveMarkedRef.current = true;
-              
-            } catch (e) {
-              
-            }
-          }
-
           // Create transports ONLY after accept (join-call), then produce/consume.
-          const rtpCapsToUse = response?.rtpCapabilities;
-          if (!rtpCapsToUse) {
-            console.error('❌ [RTC] accept-call missing rtpCapabilities');
-            acceptInProgressRef.current = false;
-            return;
-          }
+              const rtpCapsToUse = response?.rtpCapabilities;
+              if (!rtpCapsToUse) {
+                console.error('❌ [RTC] accept-call missing rtpCapabilities');
+                acceptInProgressRef.current = false;
+                return reject(new Error('accept-call missing rtpCapabilities'));
+              }
 
           // Reset transports if they exist from a previous call (safety)
           if (sendTransport.current || recvTransport.current) {
@@ -1500,8 +2190,13 @@ export const RTCProvider = ({ children }) => {
               });
             });
 
-          try {
-            await joinCall();
+              try {
+            const joinRes = await joinCall();
+            try {
+              if (joinRes?.participantsInfo && typeof joinRes.participantsInfo === 'object') {
+                participantsInfoRef.current = { ...(participantsInfoRef.current || {}), ...joinRes.participantsInfo };
+              }
+            } catch (e) {}
             const recvTransportParams = await createTransport('recv');
             const sendTransportParams = await createTransport('send');
 
@@ -1534,32 +2229,237 @@ export const RTCProvider = ({ children }) => {
               try {
                 const myIdStr = user?.data?.id?.toString?.() ?? (user?.data?.id != null ? String(user.data.id) : null);
 
-                // Prefer participants from info (set by incoming-call). Fall back to AsyncStorage (VoIP/app-killed).
-                let participantList = Array.isArray(info?.participants) ? info.participants : null;
+                // Prefer participants from join-call response (authoritative), then info, then AsyncStorage (VoIP/app-killed).
+                let participantList = Array.isArray(joinRes?.participants) ? joinRes.participants : (Array.isArray(info?.participants) ? info.participants : null);
+                let fromAsyncStorage = false;
                 if (!participantList) {
                   const saved = await AsyncStorage.getItem('incomingCallData');
                   if (saved) {
                     const parsed = JSON.parse(saved);
                     if (parsed?.callId === callIdToUse && Array.isArray(parsed?.participants)) {
                       participantList = parsed.participants;
+                      fromAsyncStorage = true;
                     }
                   }
                 }
+                
+                rtcDbg('processAccept.participantListSource', {
+                  fromJoinRes: Array.isArray(joinRes?.participants),
+                  fromInfo: Array.isArray(info?.participants),
+                  fromAsyncStorage,
+                  participantList,
+                  participantListLength: participantList?.length || 0,
+                  joinResParticipants: joinRes?.participants,
+                  infoParticipants: info?.participants,
+                });
 
-                const otherIds = (participantList || [])
-                  .map((x) => (x?.toString?.() ?? String(x)))
-                  .filter((id) => id && (!myIdStr || id !== myIdStr));
+                // Get caller ID from server response (participantList from server doesn't include caller)
+                const creatorId = joinRes?.creatorId ? (joinRes.creatorId?.toString?.() ?? String(joinRes.creatorId)) : null;
+                
+                // Build complete list of other participants (including caller if not in participantList)
+                // IMPORTANT: Include ALL participants from participantList (even those who haven't joined yet)
+                // so they show up as "Ringing..." tiles in the group view
+                const otherIdsSet = new Set();
+                
+                // Add ALL participants from participantList (these are the invited targets)
+                (participantList || []).forEach((x) => {
+                  const id = x?.toString?.() ?? String(x);
+                  if (id && id !== myIdStr) {
+                    otherIdsSet.add(id);
+                    rtcDbg('processAccept.addingParticipantFromList', { id, myIdStr, willAdd: id !== myIdStr });
+                  } else {
+                    rtcDbg('processAccept.skippingParticipantFromList', { id, myIdStr, reason: id === myIdStr ? 'isLocal' : 'invalid' });
+                  }
+                });
+                
+                // Add caller if they're not already in the list and not the local user
+                if (creatorId && creatorId !== myIdStr) {
+                  if (!otherIdsSet.has(creatorId)) {
+                    otherIdsSet.add(creatorId);
+                    rtcDbg('processAccept.addingCreator', { creatorId, myIdStr });
+                  } else {
+                    rtcDbg('processAccept.creatorAlreadyInList', { creatorId });
+                  }
+                } else {
+                  rtcDbg('processAccept.skippingCreator', { creatorId, myIdStr, reason: !creatorId ? 'noCreatorId' : 'isLocal' });
+                }
+                
+                const otherIds = Array.from(otherIdsSet);
+                
+                rtcDbg('processAccept.participantListBuilding', {
+                  participantList,
+                  participantListLength: participantList?.length || 0,
+                  myIdStr,
+                  creatorId,
+                  otherIds,
+                  otherIdsCount: otherIds.length,
+                  otherIdsSetSize: otherIdsSet.size,
+                });
 
-                // Group call if there are 2+ other people besides me
-                if (otherIds.length > 1) {
+                // Get list of already-joined participants from server (so we mark them as 'joined' not 'invited')
+                const alreadyJoined = Array.isArray(joinRes?.alreadyJoined) ? joinRes.alreadyJoined.map(x => x?.toString?.() ?? String(x)) : [];
+                
+                // Compute total participants as a unique set (server joinRes.participants may include the local user,
+                // and typically excludes the creator/caller).
+                const uniqueIds = new Set();
+                try {
+                  (participantList || []).forEach((x) => uniqueIds.add(x?.toString?.() ?? String(x)));
+                  if (creatorId) uniqueIds.add(creatorId);
+                } catch {}
+                // Remove any empty/invalid ids
+                uniqueIds.delete('');
+                uniqueIds.delete('undefined');
+                uniqueIds.delete('null');
+                const totalParticipants = uniqueIds.size;
+
+                // Group call if there are 3+ total participants (local + 2+ others).
+                // (otherIds excludes local user by construction)
+                const isGroupCall = otherIds.length >= 2;
+
+                rtcDbg('processAccept.groupDetection', {
+                  callId: callIdToUse,
+                  participantList,
+                  creatorId,
+                  otherIds,
+                  otherIdsCount: otherIds.length,
+                  totalParticipants,
+                  alreadyJoined,
+                  willBeGroupCall: isGroupCall,
+                });
+                
+                if (isGroupCall) {
+                  // Mark as group *immediately* so consume() routes tracks into participant streams, not 1:1 remoteStream.
+                  callModeRef.current.isGroupCall = true;
+                  
+                  rtcDbg('processAccept.beforeInitialize', {
+                    otherIds,
+                    otherIdsLength: otherIds.length,
+                    includeLocal: true,
+                  });
+                  
+                  // Initialize participants - this will create local + all otherIds (including caller)
+                  // IMPORTANT: This REPLACES the entire participantsMap, so all participants in otherIds must be included
                   initializeParticipants(otherIds, true, streamToUse);
-                  setCallInfo({ callId: callIdToUse, type: callTypeToUse, participantCount: otherIds.length + 1 });
+                  
+                  // Force update participantsList and callInfo to ensure group view shows
+                  const finalList = participantManager.current.getParticipantsList();
+                  
+                  rtcDbg('processAccept.afterInitialize', {
+                    finalListLength: finalList.length,
+                    finalListUserIds: finalList.map(p => p.userId),
+                    finalListDetails: finalList.map(p => ({ userId: p.userId, callStatus: p.callStatus, isLocal: p.isLocal, hasStream: !!p.stream })),
+                    otherIds,
+                  });
+                  
+                  // IMPORTANT: Set state immediately and explicitly to ensure UI updates
+                  setParticipantsList([...finalList]); // Create new array to force React re-render
+                  setCallInfo({ callId: callIdToUse, type: callTypeToUse, participantCount: totalParticipants });
+                  
+                  rtcDbg('processAccept.afterSetState', {
+                    finalListLength: finalList.length,
+                    participantCount: totalParticipants,
+                  });
+                  
+                  // Mark already-joined participants as 'joined' (not 'invited') so UI shows them correctly
+                  // IMPORTANT: Only mark participants who are in otherIds AND in alreadyJoined as 'joined'
+                  // All other participants in otherIds should remain as 'invited' (showing "Ringing...")
+                  alreadyJoined.forEach((joinedId) => {
+                    const joinedIdStr = joinedId?.toString?.() ?? String(joinedId);
+                    if (otherIds.includes(joinedIdStr)) {
+                      participantManager.current.updateParticipant(joinedIdStr, { callStatus: 'joined' });
+                    }
+                  });
+                  
+                  // Ensure all participants in otherIds exist and have correct status
+                  // This ensures invited participants (who haven't joined) show up as "Ringing..." tiles
+                  otherIds.forEach((participantId) => {
+                    const existing = participantManager.current.getParticipant(participantId);
+                    if (!existing) {
+                      // This shouldn't happen, but if it does, add them with correct status
+                      const contact = contacts.find(c =>
+                        c.server_info?.id === participantId || c.server_info?.id === parseInt(participantId)
+                      );
+                      const firstName = contact?.item?.firstName || null;
+                      const lastName = contact?.item?.lastName || null;
+                      const pIdStr = participantId?.toString?.() ?? String(participantId);
+                      const server = participantsInfoRef.current?.[pIdStr] || null;
+                      const serverFull = `${server?.firstName || ''} ${server?.lastName || ''}`.trim();
+                      const name =
+                        contact?.item?.name ||
+                        (firstName || lastName ? `${firstName || ''} ${lastName || ''}`.trim() : null) ||
+                        serverFull ||
+                        server?.username ||
+                        'Unknown';
+                      participantManager.current.addParticipant(participantId, {
+                        name,
+                        firstName: firstName || server?.firstName || null,
+                        lastName: lastName || server?.lastName || null,
+                        username: server?.username || null,
+                        avatar: contact?.server_info?.avatar,
+                        callStatus: alreadyJoined.includes(participantId) ? 'joined' : 'invited',
+                      });
+                    } else if (!alreadyJoined.includes(participantId)) {
+                      // Ensure non-joined participants have 'invited' status (for "Ringing..." display)
+                      participantManager.current.updateParticipant(participantId, { callStatus: 'invited' });
+                    }
+                  });
+                  
+                  // Refresh participants list again to reflect status changes
+                  const finalListAfterStatusUpdate = participantManager.current.getParticipantsList();
+                  setParticipantsList([...finalListAfterStatusUpdate]); // Create new array to force React re-render
+                  
+                  rtcDbg('processAccept.participantStatusFinal', {
+                    otherIds,
+                    alreadyJoined,
+                    finalParticipants: finalListAfterStatusUpdate.map(p => ({
+                      userId: p.userId,
+                      callStatus: p.callStatus,
+                      hasStream: !!p.stream,
+                      isLocal: p.isLocal,
+                    })),
+                    finalListLength: finalListAfterStatusUpdate.length,
+                    willSetStateWith: finalListAfterStatusUpdate.map(p => p.userId),
+                  });
+                  
+                  rtcDbg('processAccept.groupCallInitialized', {
+                    callId: callIdToUse,
+                    totalParticipants,
+                    participantsListLength: finalList.length,
+                    otherIds,
+                    callInfoParticipantCount: totalParticipants,
+                  });
                 } else {
                   // Ensure 1:1 mode so consume() updates remoteStream
                   callModeRef.current.isGroupCall = false;
                 }
+
+                // Keep info.participants in sync (helps later fallbacks + UI correctness)
+                try {
+                  if (Array.isArray(participantList) && participantList.length) {
+                    setInfo(prev => ({ ...(prev || {}), participants: participantList }));
+                  }
+                } catch (e) {}
               } catch (e) {
+                console.error('❌ [RTC] Error initializing participants in processAccept:', e);
                 // ignore UI init failures; media should still work
+              }
+              
+              // Ensure ParticipantManager is initialized for *true 1:1* calls so we can dynamically upgrade to group later.
+              // IMPORTANT: Do NOT run this for group calls, because it replaces the participants map and will drop
+              // invited (ringing) participants for late joiners.
+              if (!callModeRef.current.isGroupCall) {
+                try {
+                  const myIdStr = user?.data?.id?.toString?.() ?? (user?.data?.id != null ? String(user.data.id) : null);
+                  const otherIdStr = userIdToUse?.toString?.() ?? (userIdToUse != null ? String(userIdToUse) : null);
+                  if (myIdStr && otherIdStr) {
+                    // Include local + caller
+                    participantManager.current.initializeParticipants([otherIdStr], user, streamToUse, contacts, true);
+                  }
+                } catch (e) {
+                  // ignore
+                }
+              } else {
+                rtcDbg('processAccept.skip1to1ManagerInit', { reason: 'groupCall', callId: callIdToUse });
               }
 
               const audioProducer = producers.current.get('audio');
@@ -1592,18 +2492,30 @@ export const RTCProvider = ({ children }) => {
               }
 
               const existing = await getProducers();
+              rtcDbg('processAccept.getProducers', {
+                callId: callIdToUse,
+                existingProducersCount: Array.isArray(existing) ? existing.length : 0,
+                existingProducers: Array.isArray(existing) ? existing.map(p => ({ producerId: p?.producerId, userId: p?.userId, kind: p?.kind })) : [],
+                isGroupCall: callModeRef.current.isGroupCall,
+              });
+              
               if (Array.isArray(existing) && existing.length) {
                 for (const p of existing) {
                   try {
+                    rtcDbg('processAccept.consuming', { producerId: p?.producerId, userId: p?.userId, kind: p?.kind });
                     await consume(p.producerId, p.userId);
+                    rtcDbg('processAccept.consumed', { producerId: p?.producerId, userId: p?.userId, kind: p?.kind });
                   } catch (e) {
                     console.error('❌ [RTC] consume() failed (existing producer)', {
                       producerId: p?.producerId,
                       userId: p?.userId,
                       error: e?.message || e,
                     });
+                    rtcDbg('processAccept.consume.error', { producerId: p?.producerId, userId: p?.userId, error: e?.message || e });
                   }
                 }
+              } else {
+                rtcDbg('processAccept.noExistingProducers', { callId: callIdToUse });
               }
 
               // Resolve setup promise if waiting (for app-killed scenario)
@@ -1614,25 +2526,73 @@ export const RTCProvider = ({ children }) => {
                 
               }
 
-              navigate('Video Call');
-              
-              acceptedCallIdRef.current = callIdToUse;
-              acceptInProgressRef.current = false;
-          } catch (e) {
-            console.error('❌ [RTC] join/createTransport/getProducers failed (callee):', e?.message || e);
-            acceptInProgressRef.current = false;
-            return;
-          }
+                // --- iOS cold-start audio session reassert (CallKit can deactivate audio during app launch) ---
+                // If CallKit emitted endCall during cold-start, AVAudioSession can end up deactivated or misrouted.
+                // Video may still render, but audio becomes silent both ways.
+                if (Platform.OS === 'ios' && source === 'callkeep') {
+                  try {
+                    const media = callTypeToUse === 'video' ? 'video' : 'audio';
+                    // Re-activate and route audio via InCallManager (best-effort).
+                    InCallManager.start({ media });
+                    InCallManager.setForceSpeakerphoneOn(true);
+                    rtcDbg('audioSession.reassert', { media, callId: callIdToUse });
 
-        }
-      );
+                    // Retry after a short delay to win races with CallKit/session changes.
+                    setTimeout(() => {
+                      try {
+                        InCallManager.start({ media });
+                        InCallManager.setForceSpeakerphoneOn(true);
+                        rtcDbg('audioSession.reassert.retry', { media, callId: callIdToUse });
+                      } catch {}
+                    }, 600);
+                  } catch (e) {
+                    rtcDbg('audioSession.reassert.error', { error: e?.message || String(e), callId: callIdToUse });
+                  }
+                }
+
+                navigate('Video Call');
+                
+                acceptedCallIdRef.current = callIdToUse;
+                acceptSucceededCallIdRef.current = callIdToUse;
+                acceptInProgressRef.current = false;
+                return resolve();
+              } catch (e) {
+                console.error('❌ [RTC] join/createTransport/getProducers failed (callee):', e?.message || e);
+                acceptInProgressRef.current = false;
+                return reject(e);
+              }
+
+            } catch (err) {
+              acceptInProgressRef.current = false;
+              return reject(err);
+            }
+          }
+        );
+      });
     } catch (e) {
       console.error('❌ [RTC] processAccept failed:', e?.message || e);
       acceptInProgressRef.current = false;
+      throw e;
     }
   };
 
-  const endCall = async () => {
+  // Used by NavigationWrapper's CallKeep endCall handler to decide whether to notify server.
+  const shouldEmitLeaveToServer = () => {
+    try {
+      const cid = currentCallId.current;
+      if (!cid) return false;
+      // If we've actually accepted (or completed accept+join) then leaving should notify server.
+      if (acceptedCallIdRef.current === cid) return true;
+      if (acceptSucceededCallIdRef.current === cid) return true;
+      // If transports exist, we're definitely in a joined call state.
+      if (sendTransport.current || recvTransport.current) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  const endCall = async ({ emitToServer = true } = {}) => {
     
     
     // CRITICAL: Stop local stream tracks FIRST (before closing producers/transports)
@@ -1650,13 +2610,12 @@ export const RTCProvider = ({ children }) => {
       });
     }
 
-    // Notify server about call end (before closing transports)
-    if (socket.current && currentCallId.current) {
+    // Notify server about leaving the call (before closing transports)
+    if (emitToServer && socket.current && currentCallId.current) {
       try {
-        socket.current.emit('end-call', { callId: currentCallId.current });
-        
+        socket.current.emit('leave-call', { callId: currentCallId.current });
       } catch (e) {
-        console.error('❌ [RTC] Error notifying server:', e);
+        console.error('❌ [RTC] Error notifying server (leave-call):', e);
       }
     }
 
@@ -1754,12 +2713,13 @@ export const RTCProvider = ({ children }) => {
     callModeRef.current.isGroupCall = false;
     acceptInProgressRef.current = false;
     acceptedCallIdRef.current = null;
+    acceptSucceededCallIdRef.current = null;
     callKeepActiveMarkedRef.current = false;
     callKeepAnsweredRef.current = false;
     setRemoteMicMuted(false); // Reset remote mute status
     setRemoteVideoMuted(false); // Reset remote video mute status
     setCallInfo({ callId: null, type: 'video', participantCount: 0 });
-    navigate('Home');
+    popToTop();
     setInfo({});
 
     device.current = null;
@@ -1808,18 +2768,33 @@ export const RTCProvider = ({ children }) => {
   // Function to wait for incoming call setup (for app-killed scenario)
   // This ensures all mediasoup components are ready before accepting call
   const waitForIncomingCallSetup = async () => {
-    // Check if setup is already complete for the current call
-    // Required components: device, sendTransport, recvTransport, localStream
-    // Also verify setup is for the current callId (not a stale setup)
-    // Note: localStream state might not be updated yet, so we check if producers exist as alternative
-    const hasProducers = producers.current.size > 0;
-    const isSetupComplete = 
-      device.current && 
-      sendTransport.current && 
-      recvTransport.current && 
-      (localStream || hasProducers) && // Accept either state or producers as proof
+    // With the "classic room flow", we DO NOT create transports before Accept.
+    // For CallKeep cold-start accept, what we really need is:
+    // - socket connected (so accept/join can be signaled)
+    // - currentCallId known (from VoIP push AsyncStorage or server resend 'incoming-call')
+    // - setup markers match current call (avoid stale resolves)
+    //
+    // IMPORTANT: In cold-start races we can have incomingCallSetupCallId already set (from socket 'incoming-call')
+    // while currentCallId hasn't been set yet. In that case, promote setupCallId → currentCallId.
+    try {
+      if (!currentCallId.current && incomingCallSetupCallId.current) {
+        currentCallId.current = incomingCallSetupCallId.current;
+      }
+    } catch {}
+    const isSetupComplete =
       socket.current?.connected &&
-      incomingCallSetupCallId.current === currentCallId.current; // Ensure setup is for current call
+      socketRegisteredRef.current &&
+      !!currentCallId.current &&
+      incomingCallSetupCallId.current === currentCallId.current;
+
+    rtcDbg('waitForIncomingCallSetup.check', {
+      socketConnected: socket.current?.connected,
+      socketRegistered: socketRegisteredRef.current,
+      currentCallId: currentCallId.current,
+      incomingCallSetupCallId: incomingCallSetupCallId.current,
+      isSetupComplete,
+      time: Date.now(),
+    });
 
     if (isSetupComplete) {
       
@@ -1830,8 +2805,21 @@ export const RTCProvider = ({ children }) => {
 
     // Create promise if it doesn't exist or if it's for a different call
     if (!incomingCallSetupPromise.current || incomingCallSetupCallId.current !== currentCallId.current) {
+      rtcDbg('waitForIncomingCallSetup.createPromise', {
+        currentCallId: currentCallId.current,
+        incomingCallSetupCallId: incomingCallSetupCallId.current,
+        time: Date.now(),
+      });
       incomingCallSetupPromise.current = new Promise((resolve) => {
-        incomingCallSetupComplete.current = resolve;
+        incomingCallSetupComplete.current = () => {
+          rtcDbg('waitForIncomingCallSetup.resolved', {
+            socketConnected: socket.current?.connected,
+            currentCallId: currentCallId.current,
+            incomingCallSetupCallId: incomingCallSetupCallId.current,
+            time: Date.now(),
+          });
+          resolve();
+        };
       });
     }
     return incomingCallSetupPromise.current;
@@ -1859,6 +2847,7 @@ export const RTCProvider = ({ children }) => {
         toggleVideoProducer, // Export video toggle function
         waitForIncomingCallSetup, // Export for NavigationWrapper
         socket: socket.current, // Export socket for connection checking
+        shouldEmitLeaveToServer,
         // Group call exports
         participantsList, // Array of participants for UI
         participantsMap: participantManager.current, // ParticipantManager instance for lookups

@@ -3,16 +3,19 @@ import React
 import ReactAppDependencyProvider
 import PushKit
 import WebRTC
+import CallKit
+import AVFoundation
 
 
 @UIApplicationMain
-public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
+public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate, CXProviderDelegate, CXCallObserverDelegate {
   
   
   var window: UIWindow?
 
   // ✅ PKPushRegistry instance for VoIP push notifications
   var voipRegistry: PKPushRegistry?
+  private var callObserver: CXCallObserver?
 
   var reactNativeDelegate: ExpoReactNativeFactoryDelegate?
   var reactNativeFactory: RCTReactNativeFactory?
@@ -37,6 +40,11 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
     
     // ✅ Still call the library's registration method
     RNVoipPushNotificationManager.voipRegistration()
+
+    // Observe CallKit call state changes (works even when RNCallKeep owns the CXProvider delegate).
+    // We use this to re-assert AVAudioSession config on cold-start answers where audio can be silent.
+    callObserver = CXCallObserver()
+    callObserver?.setDelegate(self, queue: DispatchQueue.main)
 
 //    let options = WebRTCModuleOptions.sharedInstance()
 //    options.enableMultitaskingCameraAccess = true
@@ -80,13 +88,36 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
     return super.application(application, continue: userActivity, restorationHandler: restorationHandler) || result
   }
 
-  // //
-  // public func providerDidReset(_ provider: CXProvider) {
-  //   //
-  // }
+  public func providerDidReset(_ provider: CXProvider) {
+    // Required by CXProviderDelegate; RNCallKeep is usually the provider delegate in practice.
+  }
+
+  // Best-practice CallKit answer handling: configure audio session and fulfill.
+  public func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+    print("🟢 [AppDelegate] performAnswerCallAction uuid=\(action.callUUID.uuidString)")
+    configureAudioSessionForCall(defaultToSpeaker: true)
+    action.fulfill()
+  }
+
+  private func configureAudioSessionForCall(defaultToSpeaker: Bool) {
+    do {
+      let session = AVAudioSession.sharedInstance()
+      var options: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
+      if defaultToSpeaker {
+        options.insert(.defaultToSpeaker)
+      }
+      try session.setCategory(.playAndRecord, mode: .voiceChat, options: options)
+      try session.setActive(true, options: [])
+      print("🔊 [AppDelegate] AVAudioSession configured category=\(session.category.rawValue) mode=\(session.mode.rawValue)")
+    } catch {
+      print("❌ [AppDelegate] Failed to configure AVAudioSession: \(error)")
+    }
+  }
 
   // handle updated push credentials
   public func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+    // Re-assert category/mode; CallKit activation order during cold-start can be flaky.
+    configureAudioSessionForCall(defaultToSpeaker: true)
     RTCAudioSession.sharedInstance().audioSessionDidActivate(AVAudioSession.sharedInstance())
   }
 
@@ -104,6 +135,15 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
     
     // ✅ Tell CallKit the action is completed
     action.fulfill()
+  }
+
+  // CXCallObserverDelegate-style callback (implemented on AppDelegate since we set it as delegate).
+  // When a call connects, re-assert AVAudioSession to fix silent-audio on cold-start.
+  public func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+    if call.hasConnected && !call.hasEnded {
+      print("🟢 [AppDelegate] callObserver: call connected uuid=\(call.uuid.uuidString)")
+      configureAudioSessionForCall(defaultToSpeaker: true)
+    }
   }
 
   // ✅ THIS METHOD WILL NOW BE CALLED: handle updated push credentials

@@ -57,9 +57,20 @@ export class ParticipantManager {
         c.server_info?.id === userId || 
         c.server_info?.id === parseInt(userId)
       );
+      
+      // Build name: prefer contact, then firstName/lastName, then fallback
+      let name = 'Unknown';
+      if (contact?.item) {
+        const first = contact.item.firstName || '';
+        const last = contact.item.lastName || '';
+        name = `${first} ${last}`.trim() || contact.item.name || 'Unknown';
+      }
+      
       const participant = {
         userId: userId.toString(),
-        name: contact?.item?.name || contact?.item?.firstName || 'Unknown',
+        name,
+        firstName: contact?.item?.firstName || null,
+        lastName: contact?.item?.lastName || null,
         avatar: contact?.server_info?.avatar,
         isLocal: false,
         muted: { mic: false, video: false },
@@ -106,6 +117,26 @@ export class ParticipantManager {
   }
 
   /**
+   * Patch/update an existing participant.
+   * @param {string|number} userId
+   * @param {Object} patch - Partial participant fields to merge
+   * @returns {Object|null} Updated participant or null if not found
+   */
+  updateParticipant(userId, patch = {}) {
+    const userIdStr = userId.toString();
+    const participant = this.participantsMap.get(userIdStr);
+    if (!participant) return null;
+    const updated = { ...participant, ...patch };
+    // Preserve nested muted if patch doesn't fully override it
+    if (patch.muted && participant.muted) {
+      updated.muted = { ...participant.muted, ...patch.muted };
+    }
+    this.participantsMap.set(userIdStr, updated);
+    this._dbg('updateParticipant', { userId: userIdStr, patchKeys: Object.keys(patch || {}) });
+    return updated;
+  }
+
+  /**
    * Remove a participant from the call
    * @param {string|number} userId - User ID
    * @returns {boolean} True if participant was removed, false if not found
@@ -147,8 +178,16 @@ export class ParticipantManager {
     const participant = this.participantsMap.get(userIdStr);
     if (!participant) return false;
 
-    participant.muted[kind === 'audio' ? 'mic' : 'video'] = muted;
-    this.participantsMap.set(userIdStr, participant);
+    // Create a new participant object to ensure React detects the change
+    const updatedParticipant = {
+      ...participant,
+      muted: {
+        ...participant.muted,
+        [kind === 'audio' ? 'mic' : 'video']: muted,
+      },
+    };
+    this.participantsMap.set(userIdStr, updatedParticipant);
+    this._dbg('updateParticipantMute', { userId: userIdStr, kind, muted, newMutedState: updatedParticipant.muted });
     return true;
   }
 

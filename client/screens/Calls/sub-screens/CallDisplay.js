@@ -107,40 +107,126 @@ const CallDisplay = (props) => {
 
     useEffect(()=>{
        setInfo()
-    },[contacts]);
+    },[contacts, data]);
 
     async function repeatCall(){
 
     }
 
-    function setInfo(){
+    const _displayNameFromUserRecord = (u) => {
+        if (!u) return '';
+        const first = (u.firstName || '').trim();
+        const last = (u.lastName || '').trim();
+        const full = `${first} ${last}`.trim();
+        if (full) return full;
+        // Common backend fallbacks (if you decide to return them)
+        if (u.name) return String(u.name);
+        if (u.username) return String(u.username);
+        if (u.phone) return String(u.phone);
+        return '';
+    };
 
-        for(let i of contacts){
-            if(i.isRegistered){
-                if(i.server_info.id==data?.otherUsers[0]?.id){
-                    setName(i.item.name)
-                    setImage(data?.otherUsers[0]?.avatar)
+    const _lookupNameForUser = (uOrId) => {
+        const uid = (uOrId && typeof uOrId === 'object') ? uOrId.id : uOrId;
+        const uidNum = parseInt(uid, 10);
+        const uidStr = uid?.toString?.() ?? String(uid);
+
+        // Prefer local contacts cache (if user is saved in contacts)
+        const c = (contacts || []).find(i => {
+            if (!i?.isRegistered) return false;
+            const cid = i?.server_info?.id;
+            return cid === uidNum || cid === uidStr || cid === uid;
+        });
+
+        if (c?.item) {
+            const first = (c.item.firstName || '').trim();
+            const last = (c.item.lastName || '').trim();
+            const full = `${first} ${last}`.trim();
+            return full || c.item.name || c?.server_info?.username || uidStr;
+        }
+
+        // If not in contacts, fall back to backend-provided name fields
+        if (uOrId && typeof uOrId === 'object') {
+            const fromRecord2 = _displayNameFromUserRecord(uOrId);
+            if (fromRecord2) return fromRecord2;
+        }
+        return uidStr;
+    };
+
+    const _formatGroupTitle = (names) => {
+        const clean = (names || []).map(n => (n || '').trim()).filter(Boolean);
+        if (clean.length === 0) return 'Group Call';
+        if (clean.length === 1) return clean[0];
+        if (clean.length === 2) return `${clean[0]}, ${clean[1]}`;
+        return `${clean[0]}, ${clean[1]} & ${clean.length - 2} other`;
+    };
+
+    function setInfo(){
+        try {
+            const otherUsers = Array.isArray(data?.otherUsers) ? data.otherUsers : [];
+            const otherIds = otherUsers.map(u => u?.id).filter(Boolean);
+
+            if (otherIds.length <= 1) {
+                const u = otherUsers?.[0];
+                if (u?.id != null) {
+                    setName(_lookupNameForUser(u));
+                } else {
+                    setName('OIChat User');
                 }
+                setImage(otherUsers?.[0]?.avatar || '');
+                return;
             }
+
+            // Group call: show "A, B & N other"
+            const displayNames = otherUsers.map(_lookupNameForUser);
+            setName(_formatGroupTitle(displayNames));
+            setImage(otherUsers?.[0]?.avatar || '');
+        } catch (e) {
+            // ignore
         }
     }
 
     async function repeatCall(type) {
         try {
-            let reply = await fetch('http://216.126.78.3:8500/api/create_call',{
+            const otherUsers = Array.isArray(data?.otherUsers) ? data.otherUsers : [];
+            const otherIds = otherUsers.map(u => u?.id).filter(Boolean);
+
+            if (otherIds.length <= 1) {
+                // 1:1 call repeat
+                let reply = await fetch('http://216.126.78.3:8500/api/create_call',{
+                    method:'POST',
+                    headers:{
+                        'Content-type':'application/json',
+                        'Authorization':`Bearer ${user.token}`
+                    },
+                    body: JSON.stringify({to: otherIds[0], type})
+                });
+                let response = await reply.json();
+                if(response.success){
+                    await startCall(otherIds[0], type);
+                    setType('Outgoing')
+                } else {
+                    console.log('Error in creating a call...\n\n')
+                }
+                return;
+            }
+
+            // Group call repeat
+            let reply = await fetch('http://216.126.78.3:8500/api/create_group_call',{
                 method:'POST',
                 headers:{
                     'Content-type':'application/json',
                     'Authorization':`Bearer ${user.token}`
                 },
-                body: JSON.stringify({to: data?.otherUsers[0]?.id, type})
+                body: JSON.stringify({to: otherIds, type})
             });
             let response = await reply.json();
             if(response.success){
-                // setInCall(response.id)
-                await startCall(data?.otherUsers[0]?.id, type);
+                await startCall(otherIds, type);
                 setType('Outgoing')
-            }else console.log('Error in creating a call...\n\n')
+            } else {
+                console.log('Error in creating a group call...\n\n')
+            }
         }catch (err) {
             console.log('Error in starting a call: ', err)
         }
@@ -153,7 +239,7 @@ const CallDisplay = (props) => {
         <>
         {colorScheme=='light'?
             <TouchableOpacity style={styles.container} onPress={()=>setShowInfo(!showInfo)}>
-                <Avatar.Image size={55} source={{uri:image}}></Avatar.Image>
+                <Avatar.Image size={55} source={{uri:image || 'https://via.placeholder.com/55'}}></Avatar.Image>
                 <View style={!showInfo ? styles.message : styles.details}>
                     {showInfo ? 
                         <>
@@ -196,7 +282,7 @@ const CallDisplay = (props) => {
             :
             <TouchableOpacity onPress={()=>setShowInfo(!showInfo)}>
                 <LinearGradient colors={['rgb(39,42,55)','rgb(12,16,30)']} style={styles.container_dark}>
-                    <Avatar.Image size={55} source={{uri:image}}></Avatar.Image>
+                    <Avatar.Image size={55} source={{uri:image || 'https://via.placeholder.com/55'}}></Avatar.Image>
                     <View style={!showInfo ? styles.message : styles.details}>
                         {showInfo ? 
                             <>

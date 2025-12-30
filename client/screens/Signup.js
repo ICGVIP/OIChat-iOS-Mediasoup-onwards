@@ -37,6 +37,7 @@ const countryCodes = [
     { label: 'Cabo Verde (+238)', value: '+238' },
     { label: 'Cambodia (+855)', value: '+855' },
     { label: 'Cameroon (+237)', value: '+237' },
+    { label: 'Canada (+1)', value: '+1' },
     { label: 'Central African Republic (+236)', value: '+236' },
     { label: 'Chad (+235)', value: '+235' },
     { label: 'Chile (+56)', value: '+56' },
@@ -159,7 +160,6 @@ const countryCodes = [
     { label: 'Uganda (+256)', value: '+256' },
     { label: 'Ukraine (+380)', value: '+380' },
     { label: 'United Arab Emirates (+971)', value: '+971' },
-    { label: 'United States/Canada (+1)', value: '+1' },
     { label: 'Uruguay (+598)', value: '+598' },
     { label: 'Uzbekistan (+998)', value: '+998' },
     { label: 'Vanuatu (+678)', value: '+678' },
@@ -217,54 +217,56 @@ const SignUp = ({navigation}) => {
     };
 
     async function handleSubmit(e){
-        e.preventDefault()
-        var validRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,3}$/;
-        if(!phone||!phone.match(/^\d{10}$/)){
-            return Toast.show("❌   Invalid phone number", {
+        try { e?.preventDefault?.(); } catch (err) {}
+        if (loading) return;
+
+        const toast = (message) =>
+            Toast.show(message, {
                 duration: Toast.durations.LONG,
                 position: -60,
                 shadow: true,
                 animation: true,
                 hideOnPress: true,
                 backgroundColor:'rgb(11,11,11)',
-            })
+            });
+
+        const fNameTrim = (fname || '').trim();
+        const lNameTrim = (lname || '').trim();
+        const emailTrim = (email || '').trim();
+        const phoneTrim = (phone || '').trim();
+        const pwd = password || '';
+        const cpwd = confirmPassword || '';
+
+        // Required fields (first)
+        if (!countryCode) return toast("💡   Please select a country code");
+        if (!phoneTrim) return toast("💡   Please enter your phone number");
+        if (!fNameTrim) return toast("💡   Please enter your first name");
+        if (!lNameTrim) return toast("💡   Please enter your last name");
+        if (!emailTrim) return toast("💡   Please enter your email");
+        if (!pwd) return toast("💡   Please enter a password");
+        if (!cpwd) return toast("💡   Please confirm your password");
+
+        // Format validations
+        if (!phoneTrim.match(/^\d{10}$/)) {
+            return toast("❌   Invalid phone number");
         }
-        if(!email || !email.match(validRegex)){
-            return Toast.show("❌   Invalid email", {
-                duration: Toast.durations.LONG,
-                position: -60,
-                shadow: true,
-                animation: true,
-                hideOnPress: true,
-                backgroundColor:'rgb(11,11,11)',
-            })
+
+        // More permissive email validation (supports longer TLDs)
+        const validEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+        if (!emailTrim.match(validEmailRegex)) {
+            return toast("❌   Invalid email format");
         }
-        
-        if(!password||!countryCode||!fname||!lname){
-            return Toast.show("💡   Please complete all fields", {
-                duration: Toast.durations.LONG,
-                position: -60,
-                shadow: true,
-                animation: true,
-                hideOnPress: true,
-                backgroundColor:'rgb(11,11,11)',
-            })
+
+        if (!passwordRegex.test(pwd)) {
+            return toast("💡   Please ensure your password is of minimum 7 characters with atleast 1 number, uppercase letter and symbol");
         }
-        if( !passwordRegex.test(password)){
-            return Toast.show("💡   Please ensure your password is of minimum 7 characters with atleast 1 number, uppercase letter and symbol", {
-                duration: Toast.durations.LONG,
-                position: -60,
-                shadow: true,
-                animation: true,
-                hideOnPress: true,
-                backgroundColor:'rgb(11,11,11)',
-            })
+
+        // Password match
+        if (pwd !== cpwd) {
+            setPasswordMatchError("Passwords do not match");
+            return toast("❌   Password and confirm password do not match");
         }
-        // Check if password and confirm password match
-        if (password !== confirmPassword) {
-            setPasswordMatchError("Passwords do not match.");
-            return;
-        } 
+        setPasswordMatchError('');
         setLoading(true)
         try{
             let reply = await fetch('http://216.126.78.3:4500/signup',{
@@ -272,7 +274,7 @@ const SignUp = ({navigation}) => {
                 headers:{
                     'Content-type':'application/json'
                 },
-                body:JSON.stringify({firstName: fname, lastName: lname,email,password,phone, countryCode})
+                body:JSON.stringify({firstName: fNameTrim, lastName: lNameTrim,email: emailTrim,password: pwd,phone: phoneTrim, countryCode})
             });
 
             let response = await reply.json();
@@ -280,20 +282,14 @@ const SignUp = ({navigation}) => {
             setLoading(false)
             if(response.detail){
                 console.log(response.detail,'...murshid ke shehar mein...\n\n')
-                return Toast.show('kuchh hus....', {
-                    duration: Toast.durations.LONG,
-                    position: -60,
-                    shadow: true,
-                    animation: true,
-                    hideOnPress: true,
-                    backgroundColor:'rgb(11,11,11)',
-                  })
+                return toast(response.detail || 'Signup failed. Please try again.');
             }
             navigation.push('Verify',{phone:response.phone})
             console.log('User registration done')
         }catch(err){
             setLoading(false)
             console.log(err,'dfjhvbfdhvbfd')
+            toast('An error occurred during signup. Please try again.');
         }
         
     }

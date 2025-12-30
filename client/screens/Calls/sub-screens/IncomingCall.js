@@ -10,6 +10,7 @@ import { useRTC } from '../../../context/rtc';
 import Video from 'react-native-video';
 import { useSelector } from 'react-redux';
 import InCallManager from 'react-native-incall-manager';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const windowHeight = Dimensions.get('window').height;
 const windowWidth = Dimensions.get('window').width;
@@ -32,7 +33,8 @@ export const IncomingCall = () => {
   const [pic, setPic] = useState('');
 
   useEffect(() => {
-    InCallManager.startRingtone('_DEFAULT_');
+    // InCallManager incoming ringtone disabled (CallKeep handles ringing)
+    // InCallManager.startRingtone('_DEFAULT_');
 
     const myIdStr = user?.data?.id?.toString?.();
     const participantList = Array.isArray(info?.participants) ? info.participants : (info?.id ? [info.id] : []);
@@ -40,26 +42,66 @@ export const IncomingCall = () => {
       .map(x => x?.toString?.() ?? String(x))
       .filter(id => id && id !== myIdStr);
 
-    const lookup = (idStr) => {
+    const lookup = (idStr, participantsInfoMap) => {
       const c = contacts?.find?.(ct => ct?.isRegistered && ct?.server_info?.id?.toString?.() === idStr);
+      if (c?.item) {
+        const first = c.item.firstName || '';
+        const last = c.item.lastName || '';
+        return {
+          name: `${first} ${last}`.trim() || c.item.name || 'Unknown',
+          avatar: c.server_info?.avatar || '',
+        };
+      }
+      // Not in contacts - try participantsInfo map (server-sent per-user info)
+      try {
+        const pi = participantsInfoMap?.[idStr] || null;
+        const full = `${pi?.firstName || ''} ${pi?.lastName || ''}`.trim();
+        if (full || pi?.username) {
+          return { name: full || pi.username, avatar: '' };
+        }
+      } catch {}
+
+      // As a special-case, for the *caller* we may have callerFirstName/LastName.
+      if (idStr === info?.id?.toString?.()) {
+        const serverFirst = info?.callerFirstName || null;
+        const serverLast = info?.callerLastName || null;
+        const full = `${serverFirst || ''} ${serverLast || ''}`.trim();
+        if (full) return { name: full, avatar: '' };
+      }
       return {
-        name: c?.item?.name || `${c?.item?.firstName || ''} ${c?.item?.lastName || ''}`.trim() || idStr,
-        avatar: c?.server_info?.avatar || '',
+        name: 'Unknown', // never show raw ID
+        avatar: '',
       };
     };
 
-    if (otherIds.length > 1) {
-      // Group call: show all other participants so user knows who’s in the call
-      const names = otherIds.map(id => lookup(id).name).filter(Boolean);
-      const display = names.length <= 2 ? names.join(' & ') : `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
-      setName(display || 'Group Call');
-      setPic(''); // keep blank for now (optional: group avatar)
-    } else if (otherIds.length === 1) {
-      const { name, avatar } = lookup(otherIds[0]);
-      setName(name || 'OIChat User');
-      setPic(avatar || '');
-    }
-  }, []);
+    (async () => {
+      // participantsInfo can come from rtc.js via info, or from AsyncStorage (cold-start / races)
+      let participantsInfoMap = info?.participantsInfo || null;
+      if (!participantsInfoMap) {
+        try {
+          const saved = await AsyncStorage.getItem('incomingCallData');
+          if (saved) {
+            const parsed = JSON.parse(saved);
+            participantsInfoMap = parsed?.participantsInfo || null;
+          }
+        } catch {}
+      }
+
+      if (otherIds.length > 1) {
+        // Group call: show all other participants so user knows who’s in the call
+        const names = otherIds
+          .map(id => lookup(id, participantsInfoMap).name)
+          .filter((n) => n && n !== 'Unknown');
+        const display = names.length <= 2 ? names.join(' & ') : `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
+        setName(display || 'Group Call');
+        setPic(''); // keep blank for now (optional: group avatar)
+      } else if (otherIds.length === 1) {
+        const { name, avatar } = lookup(otherIds[0], participantsInfoMap);
+        setName(name || 'OIChat User');
+        setPic(avatar || '');
+      }
+    })();
+  }, [info?.id, info?.participants, info?.participantsInfo, info?.callerFirstName, info?.callerLastName, contacts, user?.data?.id]);
 
   const handleEndCall = async () => {
     try {
@@ -85,9 +127,9 @@ export const IncomingCall = () => {
       <SafeAreaView style={{ flex: 1 }}>
         <View style={styles.headerPill}>
           <Avatar.Image size={60} style={{ backgroundColor: 'white' }} source={{ uri: pic }} />
-          <View style={{ marginHorizontal: 10 }}>
+          <View style={{ marginHorizontal: 10, flex: 1, minWidth: 0 }}>
             <Text style={{ fontSize: 15, color: 'white', letterSpacing: 1, marginVertical: 5 }}>Mobile</Text>
-            <Text numberOfLines={1} ellipsizeMode="tail" style={{ fontSize: 19, fontWeight: 'bold', color: 'white' }}>{name}</Text>
+            <Text numberOfLines={1} ellipsizeMode="tail" style={{ fontSize: 19, fontWeight: 'bold', color: 'white', flexShrink: 1 }}>{name}</Text>
           </View>
         </View>
 
@@ -177,28 +219,52 @@ export const OutgoingCall = (props) => {
             .map(x => x?.toString?.() ?? String(x))
             .filter(id => id && id !== myIdStr);
 
-        const lookupName = (idStr) => {
+        const lookupName = (idStr, participantsInfoMap) => {
             const c = contacts?.find?.(ct => ct?.isRegistered && ct?.server_info?.id?.toString?.() === idStr);
             const first = c?.item?.firstName || '';
             const last = c?.item?.lastName || '';
-            return `${first} ${last}`.trim() || c?.item?.name || idStr;
+            const fromContacts = `${first} ${last}`.trim() || c?.item?.name;
+            if (fromContacts) return fromContacts;
+            try {
+              const pi = participantsInfoMap?.[idStr] || null;
+              const full = `${pi?.firstName || ''} ${pi?.lastName || ''}`.trim();
+              return full || pi?.username || 'Unknown';
+            } catch {
+              return 'Unknown';
+            }
         };
         const lookupAvatar = (idStr) => {
             const c = contacts?.find?.(ct => ct?.isRegistered && ct?.server_info?.id?.toString?.() === idStr);
             return c?.server_info?.avatar || '';
         };
 
-        if (otherIds.length > 1) {
-            const names = otherIds.map(lookupName).filter(Boolean);
-            const display = names.length <= 2 ? names.join(' & ') : `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
-            setName(display);
-            setPic('');
-        } else if (otherIds.length === 1) {
-            setName(lookupName(otherIds[0]));
-            setPic(lookupAvatar(otherIds[0]));
-        }
+        (async () => {
+          let participantsInfoMap = info?.participantsInfo || null;
+          if (!participantsInfoMap) {
+            try {
+              const saved = await AsyncStorage.getItem('incomingCallData');
+              if (saved) {
+                const parsed = JSON.parse(saved);
+                participantsInfoMap = parsed?.participantsInfo || null;
+              }
+            } catch {}
+          }
 
-    },[info?.id, info?.participants, contacts, user?.data?.id])
+          if (otherIds.length > 1) {
+              const names = otherIds
+                .map((id) => lookupName(id, participantsInfoMap))
+                .filter((n) => n && n !== 'Unknown');
+              const display = names.length <= 2 ? names.join(' & ') : `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
+              setName(display || 'Group Call');
+              setPic('');
+          } else if (otherIds.length === 1) {
+              const resolved = lookupName(otherIds[0], participantsInfoMap);
+              setName(resolved || 'OIChat User');
+              setPic(lookupAvatar(otherIds[0]));
+          }
+        })();
+
+    },[info?.id, info?.participants, info?.participantsInfo, contacts, user?.data?.id])
 
     // Set default to earpiece (not speaker) when outgoing call starts
     useEffect(() => {

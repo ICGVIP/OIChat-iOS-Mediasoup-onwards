@@ -16,7 +16,6 @@ import {OverlayNewBroadcast, OverlayNewContact } from './sub-screens/Overlays';
 
 //Protect Hidden Chats Section
 import RNBiometrics from "react-native-simple-biometrics";
-import VoipPushNotification from "react-native-voip-push-notification";
 import { useRTC } from '../../context/rtc';
 
 
@@ -128,38 +127,28 @@ const Chats = ({navigation}) => {
 
 
   useEffect(()=>{
-    if(!user||!expoPushToken) return;
-
-    VoipPushNotification.addEventListener('register', async (token)=>{
-
-      let reply = await fetch('http://216.126.78.3:8500/api/register-voip-token',{
-        method:'POST',
-        headers:{
-          'Content-type':'application/json',
-          'Authorization':`Bearer ${user.token}`
-        },
-        body:JSON.stringify({voipToken: token})
-      });
-    });
-
-    VoipPushNotification.registerVoipToken();
+    // Expo (non-VoIP) push token registration stays here.
+    // VoIP token registration/sync is handled at app-root (NavigationWrapper) so it also works if user never opens Chats.
+    if(!user || !expoPushToken) return;
 
     (
       async function(){
-        let reply = await fetch('http://216.126.78.3:8500/api/set/push_token',{
-          method:'POST',
-          headers:{
-            'Content-type':'application/json',
-            'Authorization':`Bearer ${user.token}`
-          },
-          body:JSON.stringify({token:expoPushToken})
-        });
-        let response = await reply.json();
-
+        try {
+          let reply = await fetch('http://216.126.78.3:8500/api/set/push_token',{
+            method:'POST',
+            headers:{
+              'Content-type':'application/json',
+              'Authorization':`Bearer ${user.token}`
+            },
+            body:JSON.stringify({token:expoPushToken})
+          });
+          try { await reply.json(); } catch {}
+        } catch (e) {
+          console.log('Error setting expo push token:', e?.message || e);
+        }
       }
     )();
 
-    
     return ()=>{
       setAction(0);
       setChannel(null);
