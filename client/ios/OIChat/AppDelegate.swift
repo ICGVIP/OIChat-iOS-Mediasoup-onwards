@@ -166,9 +166,60 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate, CXProviderDel
   ) {
     print("📱 [AppDelegate] VoIP push received - app state may be backgrounded/killed")
 
-    // process the payload
-    let uuid = payload.dictionaryPayload["uuid"]
-    let hasVideoValue = payload.dictionaryPayload["hasVideo"]
+    // Process payload (support both "incoming" and "end" actions)
+    let dict = payload.dictionaryPayload
+
+    // uuid can arrive as String / NSNumber; normalize to String safely
+    let uuidStr: String? = {
+      if let s = dict["uuid"] as? String { return s }
+      if let n = dict["uuid"] as? NSNumber { return n.stringValue }
+      if let i = dict["uuid"] as? Int { return String(i) }
+      return nil
+    }()
+
+    let action = (dict["action"] as? String)?.lowercased()
+
+    // If server tells us to end/dismiss the CallKit UI (invite timeout), do it and return early.
+    if action == "end" {
+      if let uuid = uuidStr {
+        print("📴 [AppDelegate] VoIP push action=end → ending CallKit call uuid=\(uuid)")
+        DispatchQueue.main.async {
+          // RNCallKeep JS API has:
+          // - endCall(uuid)                   (no reason)
+          // - reportEndCallWithUUID(uuid, reason) (requires reason)
+          //
+          // Swift/ObjC bridging differs a bit across RNCallKeep versions, so invoke dynamically:
+          // Prefer reporting an end reason (UNANSWERED=3) if available, otherwise fall back to endCall.
+          let reason = NSNumber(value: 3) // "unanswered" / timeout
+          let selReport = NSSelectorFromString("reportEndCallWithUUID:reason:")
+          let selEnd = NSSelectorFromString("endCall:")
+
+          if RNCallKeep.responds(to: selReport) {
+            _ = RNCallKeep.perform(selReport, with: uuid, with: reason)
+            print("📴 [AppDelegate] Used RNCallKeep.reportEndCallWithUUID(uuid, reason=3)")
+          } else if RNCallKeep.responds(to: selEnd) {
+            _ = RNCallKeep.perform(selEnd, with: uuid)
+            print("📴 [AppDelegate] Used RNCallKeep.endCall(uuid)")
+          } else {
+            print("⚠️ [AppDelegate] RNCallKeep has no end call selector available")
+          }
+        }
+      } else {
+        print("⚠️ [AppDelegate] VoIP push action=end but missing uuid")
+      }
+
+      // Still forward to RNVoipPushNotificationManager so JS can observe the push if needed.
+      RNVoipPushNotificationManager.didReceiveIncomingPush(
+        with: payload,
+        forType: type.rawValue
+      )
+
+      // Finish PushKit handling.
+      completion()
+      return
+    }
+
+    let hasVideoValue = dict["hasVideo"]
     let hasVideo: Bool = {
       if let boolValue = hasVideoValue as? Bool {
         return boolValue
@@ -181,11 +232,13 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate, CXProviderDel
       }
       return false
     }()
-    let handle = payload.dictionaryPayload["handle"]
-    let caller = payload.dictionaryPayload["callerName"]
+    let handleStr: String = (dict["handle"] as? String) ?? (dict["callerId"] as? String) ?? "Unknown"
+    let callerStr: String = (dict["callerName"] as? String) ?? handleStr
 
 
-    RNVoipPushNotificationManager.addCompletionHandler(uuid as! String, completionHandler: completion)
+    if let uuid = uuidStr {
+      RNVoipPushNotificationManager.addCompletionHandler(uuid, completionHandler: completion)
+    }
 
     RNVoipPushNotificationManager.didReceiveIncomingPush(
         with: payload,
@@ -194,12 +247,13 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate, CXProviderDel
 
     // display the incoming call notification
     // ✅ This will show the CallKit UI even when app is killed
+    if let uuid = uuidStr {
     RNCallKeep.reportNewIncomingCall(
-      uuid as! String,
-      handle: handle as! String,
+        uuid,
+        handle: handleStr,
         handleType: "generic",
         hasVideo: hasVideo,
-      localizedCallerName: caller as! String,
+        localizedCallerName: callerStr,
         supportsHolding: true,
         supportsDTMF: true,
         supportsGrouping: true,
@@ -208,6 +262,10 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate, CXProviderDel
         payload: nil,
         withCompletionHandler: completion
     )
+    } else {
+      print("⚠️ [AppDelegate] VoIP push missing uuid; cannot report incoming call")
+      completion()
+    }
   }
   
   // ✅ ADD THIS: Handle push registry invalid token (optional but recommended)

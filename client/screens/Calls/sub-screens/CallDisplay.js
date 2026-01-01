@@ -103,6 +103,7 @@ const CallDisplay = (props) => {
     let [name,setName] = useState('OIChat User')
     let [image, setImage] = useState('');
     let [showInfo, setShowInfo] = useState(false);
+    let [isCalling, setIsCalling] = useState(false);
     let {setType, startCall, setInCall} = useRTC()
 
     useEffect(()=>{
@@ -187,6 +188,7 @@ const CallDisplay = (props) => {
     }
 
     async function repeatCall(type) {
+        setIsCalling(true);
         try {
             const otherUsers = Array.isArray(data?.otherUsers) ? data.otherUsers : [];
             const otherIds = otherUsers.map(u => u?.id).filter(Boolean);
@@ -229,6 +231,8 @@ const CallDisplay = (props) => {
             }
         }catch (err) {
             console.log('Error in starting a call: ', err)
+        } finally {
+            setIsCalling(false);
         }
     }
 
@@ -243,11 +247,19 @@ const CallDisplay = (props) => {
                 <View style={!showInfo ? styles.message : styles.details}>
                     {showInfo ? 
                         <>
-                            <TouchableOpacity style={{marginHorizontal:5}} onPress={()=>repeatCall('video')}>
+                            <TouchableOpacity 
+                                style={{marginHorizontal:5, opacity: isCalling ? 0.5 : 1}} 
+                                onPress={()=>repeatCall('video')}
+                                disabled={isCalling}
+                            >
                                 <Ionicons name="videocam-outline" size={25} color="rgb(99, 197, 93)" style={{marginBottom:10}}/>
                                 <Text style={{color:'rgb(99, 197, 93)'}}>Video</Text>
                             </TouchableOpacity>
-                            <TouchableOpacity style={{marginHorizontal:5}} onPress={()=>repeatCall('audio')}>
+                            <TouchableOpacity 
+                                style={{marginHorizontal:5, opacity: isCalling ? 0.5 : 1}} 
+                                onPress={()=>repeatCall('audio')}
+                                disabled={isCalling}
+                            >
                                 <Ionicons name="call-outline" size={25} color="rgb(99, 197, 93)" style={{marginBottom:10}}/>
                                 <Text style={{color:'rgb(99, 197, 93)'}}>Audio</Text>
                             </TouchableOpacity>
@@ -286,11 +298,19 @@ const CallDisplay = (props) => {
                     <View style={!showInfo ? styles.message : styles.details}>
                         {showInfo ? 
                             <>
-                                <TouchableOpacity style={{marginHorizontal:5}} onPress={()=>repeatCall('video')}>
+                                <TouchableOpacity 
+                                    style={{marginHorizontal:5, opacity: isCalling ? 0.5 : 1}} 
+                                    onPress={()=>repeatCall('video')}
+                                    disabled={isCalling}
+                                >
                                     <Ionicons name="videocam-outline" size={25} color="rgb(99, 197, 93)" style={{marginBottom:10}}/>
                                     <Text style={{color:'rgb(99, 197, 93)'}}>Video</Text>
                                 </TouchableOpacity>
-                                <TouchableOpacity style={{marginHorizontal:5}} onPress={()=>repeatCall('audio')}>
+                                <TouchableOpacity 
+                                    style={{marginHorizontal:5, opacity: isCalling ? 0.5 : 1}} 
+                                    onPress={()=>repeatCall('audio')}
+                                    disabled={isCalling}
+                                >
                                     <Ionicons name="call-outline" size={25} color="rgb(99, 197, 93)" style={{marginBottom:10}}/>
                                     <Text style={{color:'rgb(99, 197, 93)'}}>Audio</Text>
                                 </TouchableOpacity>

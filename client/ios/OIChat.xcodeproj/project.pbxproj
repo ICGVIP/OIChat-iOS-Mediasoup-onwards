@@ -3,11 +3,13 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 54;
+	objectVersion = 70;
 	objects = {
 
 /* Begin PBXBuildFile section */
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
+		36C719862F05AC8E00161C5E /* ReplayKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36C719852F05AC8E00161C5E /* ReplayKit.framework */; };
+		36C7198D2F05AC8F00161C5E /* Screen Share.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 36C719842F05AC8E00161C5E /* Screen Share.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		36E2731A2EF0B30100C91E24 /* CallKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36E273192EF0B30100C91E24 /* CallKit.framework */; };
 		36E2731C2EF0B30800C91E24 /* Intents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36E2731B2EF0B30800C91E24 /* Intents.framework */; settings = {ATTRIBUTES = (Weak, ); }; };
 		375B6BF65B4C291392550C0D /* ExpoModulesProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25C752C610F39DCFDBE871F4 /* ExpoModulesProvider.swift */; };
@@ -18,12 +20,38 @@
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		36C7198B2F05AC8F00161C5E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 83CBB9F71A601CBA00E9B192 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 36C719832F05AC8E00161C5E;
+			remoteInfo = "Screen Share";
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		36C7198E2F05AC8F00161C5E /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				36C7198D2F05AC8F00161C5E /* Screen Share.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		13B07F961A680F5B00A75B9A /* OIChat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OIChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = OIChat/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = OIChat/Info.plist; sourceTree = "<group>"; };
 		165E1D862A432F861A977565 /* Pods-OIChat.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-OIChat.debug.xcconfig"; path = "Target Support Files/Pods-OIChat/Pods-OIChat.debug.xcconfig"; sourceTree = "<group>"; };
 		25C752C610F39DCFDBE871F4 /* ExpoModulesProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ExpoModulesProvider.swift; path = "Pods/Target Support Files/Pods-OIChat/ExpoModulesProvider.swift"; sourceTree = "<group>"; };
+		36C719842F05AC8E00161C5E /* Screen Share.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = "Screen Share.appex"; sourceTree = BUILT_PRODUCTS_DIR; };
+		36C719852F05AC8E00161C5E /* ReplayKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ReplayKit.framework; path = System/Library/Frameworks/ReplayKit.framework; sourceTree = SDKROOT; };
 		36E273172EF0B1FD00C91E24 /* libRNCallKeep.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; path = libRNCallKeep.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		36E273192EF0B30100C91E24 /* CallKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CallKit.framework; path = System/Library/Frameworks/CallKit.framework; sourceTree = SDKROOT; };
 		36E2731B2EF0B30800C91E24 /* Intents.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Intents.framework; path = System/Library/Frameworks/Intents.framework; sourceTree = SDKROOT; };
@@ -37,6 +65,20 @@
 		F11748442D0722820044C1D9 /* OIChat-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "OIChat-Bridging-Header.h"; path = "OIChat/OIChat-Bridging-Header.h"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		36C719912F05AC8F00161C5E /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 36C719832F05AC8E00161C5E /* Screen Share */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		36C719872F05AC8F00161C5E /* Screen Share */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (36C719912F05AC8F00161C5E /* PBXFileSystemSynchronizedBuildFileExceptionSet */, ); explicitFileTypes = {}; explicitFolders = (); path = "Screen Share"; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
 /* Begin PBXFrameworksBuildPhase section */
 		13B07F8C1A680F5B00A75B9A /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
@@ -45,6 +87,14 @@
 				36E2731C2EF0B30800C91E24 /* Intents.framework in Frameworks */,
 				36E2731A2EF0B30100C91E24 /* CallKit.framework in Frameworks */,
 				9FC7A1CB4635BBDA53B50C51 /* libPods-OIChat.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		36C719812F05AC8E00161C5E /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				36C719862F05AC8E00161C5E /* ReplayKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -73,6 +123,7 @@
 				36E273172EF0B1FD00C91E24 /* libRNCallKeep.a */,
 				ED297162215061F000B7C4FE /* JavaScriptCore.framework */,
 				B6314673D4D10B3887C00182 /* libPods-OIChat.a */,
+				36C719852F05AC8E00161C5E /* ReplayKit.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -98,6 +149,7 @@
 			children = (
 				13B07FAE1A68108700A75B9A /* OIChat */,
 				832341AE1AAA6A7D00B99B32 /* Libraries */,
+				36C719872F05AC8F00161C5E /* Screen Share */,
 				83CBBA001A601CBA00E9B192 /* Products */,
 				2D16E6871FA4F8E400B85C8A /* Frameworks */,
 				3AF26888D47480343959A5A7 /* Pods */,
@@ -112,6 +164,7 @@
 			isa = PBXGroup;
 			children = (
 				13B07F961A680F5B00A75B9A /* OIChat.app */,
+				36C719842F05AC8E00161C5E /* Screen Share.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -156,15 +209,39 @@
 				00DD1BFF1BD5951E006B06BC /* Bundle React Native code and images */,
 				800E24972A6A228C8D4807E9 /* [CP] Copy Pods Resources */,
 				1C2BBFA298AC80A28047A2CC /* [CP] Embed Pods Frameworks */,
+				36C7198E2F05AC8F00161C5E /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				36C7198C2F05AC8F00161C5E /* PBXTargetDependency */,
 			);
 			name = OIChat;
 			productName = OIChat;
 			productReference = 13B07F961A680F5B00A75B9A /* OIChat.app */;
 			productType = "com.apple.product-type.application";
+		};
+		36C719832F05AC8E00161C5E /* Screen Share */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 36C719922F05AC8F00161C5E /* Build configuration list for PBXNativeTarget "Screen Share" */;
+			buildPhases = (
+				36C719802F05AC8E00161C5E /* Sources */,
+				36C719812F05AC8E00161C5E /* Frameworks */,
+				36C719822F05AC8E00161C5E /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				36C719872F05AC8F00161C5E /* Screen Share */,
+			);
+			name = "Screen Share";
+			packageProductDependencies = (
+			);
+			productName = "Screen Share";
+			productReference = 36C719842F05AC8E00161C5E /* Screen Share.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -172,10 +249,14 @@
 		83CBB9F71A601CBA00E9B192 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
+				LastSwiftUpdateCheck = 2600;
 				LastUpgradeCheck = 1130;
 				TargetAttributes = {
 					13B07F861A680F5B00A75B9A = {
 						LastSwiftMigration = 1250;
+					};
+					36C719832F05AC8E00161C5E = {
+						CreatedOnToolsVersion = 26.0.1;
 					};
 				};
 			};
@@ -193,6 +274,7 @@
 			projectRoot = "";
 			targets = (
 				13B07F861A680F5B00A75B9A /* OIChat */,
+				36C719832F05AC8E00161C5E /* Screen Share */,
 			);
 		};
 /* End PBXProject section */
@@ -206,6 +288,13 @@
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */,
 				876FAFE3D9B7413896CB25D3 /* PrivacyInfo.xcprivacy in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		36C719822F05AC8E00161C5E /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -361,7 +450,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		36C719802F05AC8E00161C5E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		36C7198C2F05AC8F00161C5E /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 36C719832F05AC8E00161C5E /* Screen Share */;
+			targetProxy = 36C7198B2F05AC8F00161C5E /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		13B07F941A680F5B00A75B9A /* Debug */ = {
@@ -437,6 +541,97 @@
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = Release;
+		};
+		36C7198F2F05AC8F00161C5E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CODE_SIGN_ENTITLEMENTS = "Screen Share/Screen Share.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = SMU593ZW5Y;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Screen Share/Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "Screen Share";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.oichat.ios.Screen-Share";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		36C719902F05AC8F00161C5E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CODE_SIGN_ENTITLEMENTS = "Screen Share/Screen Share.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = SMU593ZW5Y;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Screen Share/Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "Screen Share";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MARKETING_VERSION = 1.0;
+				MTL_FAST_MATH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = "app.oichat.ios.Screen-Share";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
 		};
@@ -566,6 +761,15 @@
 			buildConfigurations = (
 				13B07F941A680F5B00A75B9A /* Debug */,
 				13B07F951A680F5B00A75B9A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		36C719922F05AC8F00161C5E /* Build configuration list for PBXNativeTarget "Screen Share" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				36C7198F2F05AC8F00161C5E /* Debug */,
+				36C719902F05AC8F00161C5E /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

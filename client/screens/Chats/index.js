@@ -134,21 +134,21 @@ const Chats = ({navigation}) => {
     (
       async function(){
         try {
-          let reply = await fetch('http://216.126.78.3:8500/api/set/push_token',{
-            method:'POST',
-            headers:{
-              'Content-type':'application/json',
-              'Authorization':`Bearer ${user.token}`
-            },
-            body:JSON.stringify({token:expoPushToken})
-          });
+        let reply = await fetch('http://216.126.78.3:8500/api/set/push_token',{
+          method:'POST',
+          headers:{
+            'Content-type':'application/json',
+            'Authorization':`Bearer ${user.token}`
+          },
+          body:JSON.stringify({token:expoPushToken})
+        });
           try { await reply.json(); } catch {}
         } catch (e) {
           console.log('Error setting expo push token:', e?.message || e);
         }
       }
     )();
-
+    
     return ()=>{
       setAction(0);
       setChannel(null);

@@ -274,15 +274,55 @@ const NewCallScreen = ({navigation}) => {
     
 
     async function handleCall(type){
-        const selectedIds = (selected || []).map(s => s?.id).filter(Boolean);
-        console.log('📱 [NewCall] handleCall called', { type, selectedIds, selectedCount: selectedIds.length });
-        
-        if (selectedIds.length === 0) {
-            console.error('❌ [NewCall] No users selected');
-            return;
-        }
-
+        setCreating(true);
         try {
+            // Step 1: Collect individual contact IDs
+            const individualIds = (selected || []).map(s => s?.id).filter(Boolean);
+            
+            // Step 2: Expand all selected groups into their member lists
+            const groupMemberIds = [];
+            (groupSelected || []).forEach(group => {
+                if (Array.isArray(group?.otherUsers)) {
+                    // otherUsers is an array of user objects, extract IDs
+                    group.otherUsers.forEach(user => {
+                        const userId = user?.id || user?.userId || user;
+                        if (userId) {
+                            groupMemberIds.push(userId);
+                        }
+                    });
+                }
+            });
+            
+            // Step 3: Merge individual contacts + group members, then deduplicate
+            const allIds = [...individualIds, ...groupMemberIds];
+            const uniqueIdsSet = new Set();
+            const myId = user?.data?.id;
+            
+            allIds.forEach(id => {
+                const idStr = id?.toString?.() ?? String(id);
+                // Exclude current user and ensure it's a valid ID
+                if (idStr && idStr !== 'undefined' && idStr !== 'null' && idStr !== myId?.toString?.()) {
+                    uniqueIdsSet.add(idStr);
+                }
+            });
+            
+            const selectedIds = Array.from(uniqueIdsSet);
+            
+            console.log('📱 [NewCall] handleCall called', { 
+                type, 
+                selectedIds, 
+                selectedCount: selectedIds.length,
+                individualCount: individualIds.length,
+                groupCount: groupSelected.length,
+                groupMemberCount: groupMemberIds.length,
+                uniqueCount: selectedIds.length
+            });
+            
+            if (selectedIds.length === 0) {
+                console.error('❌ [NewCall] No users selected (after deduplication)');
+                return;
+            }
+
             if (selectedIds.length === 1) {
                 console.log('🌐 [NewCall] Calling create_call API (1:1)...');
                 let reply = await fetch('http://216.126.78.3:8500/api/create_call',{
@@ -335,10 +375,11 @@ const NewCallScreen = ({navigation}) => {
                     console.error('❌ [NewCall] Group API call failed:', response);
                 }
             }
-        }catch (err) {
+        } catch (err) {
             console.error('❌ [NewCall] Error in starting a call:', err);
+        } finally {
+            setCreating(false);
         }
-        
     }
 
    
@@ -353,7 +394,7 @@ const NewCallScreen = ({navigation}) => {
                 </View>
                 <View style={styles.contacts}>
                     <TextInput style={colorScheme=='light'?styles.searchInput:styles.searchInput_dark} placeholder="Search contacts" onChangeText={(text)=>setSearchText(text)}/>
-                    <ScrollView style={styles.contactsScroll} contentContainerStyle={{justifyContent:'flex-start',alignItems:'center', paddingBottom:100}}>
+                    <ScrollView style={styles.contactsScroll} contentContainerStyle={{justifyContent:'flex-start',alignItems:'center', paddingBottom:200}}>
                         
                         <Text style={colorScheme=='light'?{color:'black',fontSize:25,fontWeight:'bold',width:'100%',marginVertical:20, paddingLeft:15}:{color:'white',fontSize:25,fontWeight:'bold',width:'100%',paddingLeft:15, marginVertical:20}}>Groups</Text>
                         {groups.length==0&&<Text style={styles.notonoi}>No groups to show at the moment</Text>}
@@ -387,10 +428,10 @@ const NewCallScreen = ({navigation}) => {
                     </ScrollView>
                 
                 </View>
-                <Button mode="contained" disabled={creating} onPress={handleCall.bind(null,'audio')} buttonColor='#ff8a00' textColor='white' style={{position:'absolute',bottom:130,width:screenWidth * 0.18,left:(screenWidth - screenWidth * 0.5 - 20)/2}} labelStyle={{fontWeight:'bold',fontSize:17}}>
+                <Button mode="contained" disabled={creating || (selected.length === 0 && groupSelected.length === 0)} onPress={handleCall.bind(null,'audio')} buttonColor='#ff8a00' textColor='white' style={{position:'absolute',bottom:130,width:screenWidth * 0.18,left:(screenWidth - screenWidth * 0.5 - 20)/2}} labelStyle={{fontWeight:'bold',fontSize:17}}>
                     <Ionicons name="call" size={24} color="white" />
                 </Button>
-                <Button mode="contained" disabled={creating} onPress={handleCall.bind(null,'video')} buttonColor='#ff8a00' textColor='white' style={{position:'absolute',bottom:130,width:screenWidth * 0.18,right:(screenWidth - screenWidth * 0.5 - 20)/2}} labelStyle={{fontWeight:'bold',fontSize:17}}>
+                <Button mode="contained" disabled={creating || (selected.length === 0 && groupSelected.length === 0)} onPress={handleCall.bind(null,'video')} buttonColor='#ff8a00' textColor='white' style={{position:'absolute',bottom:130,width:screenWidth * 0.18,right:(screenWidth - screenWidth * 0.5 - 20)/2}} labelStyle={{fontWeight:'bold',fontSize:17}}>
                     <Ionicons name="videocam" size={24} color="white" />
                 </Button>
                 <Button mode="outlined" disabled={creating} onPress={()=>{}} textColor='#ff8a00' style={{position:'absolute',bottom:50,height:50,width:screenWidth * 0.8,left:(screenWidth - screenWidth * 0.8)/2, borderColor:'#ff8a00', borderRadius:200}} labelStyle={{fontSize:17, alignItems:'center', justifyContent:'center', textAlign:'center'}}>

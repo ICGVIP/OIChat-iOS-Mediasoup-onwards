@@ -244,6 +244,25 @@ function broadcastToPeers(io, callData, event, payload, { excludeUserId } = {}) 
   } catch {}
 }
 
+// ---- Screen share guard: only one active screen share producer per call ----
+function getActiveScreenShare(callData) {
+  try {
+    const s = callData?.activeScreenShare;
+    if (s && s.producerId && s.userId != null) return s;
+  } catch {}
+  return null;
+}
+
+function clearActiveScreenShare(callData, producerId) {
+  try {
+    const cur = callData?.activeScreenShare;
+    if (!cur) return;
+    if (!producerId || cur.producerId === producerId) {
+      callData.activeScreenShare = null;
+    }
+  } catch {}
+}
+
 function scheduleInviteTimeout({ io, callId, callData, inviteeId, inviterId }) {
   const invites = ensureInvites(callData);
   const inviteMeta = ensureInviteMeta(callData);
@@ -484,7 +503,7 @@ io.on('connection', socket => {
     // - they haven't joined yet
     // - we haven't already resent it (per-user idempotency)
     for (const [callId, callData] of activeCalls.entries()) {
-      const calleePeer = callData.peers.get(userId);
+        const calleePeer = callData.peers.get(userId);
       const callerId = callData.creatorId ?? Array.from(callData.peers.keys())[0];
       const allParticipants = getParticipantsSnapshot(callData);
 
@@ -538,19 +557,19 @@ io.on('connection', socket => {
           }
         }
         
-        socket.emit('incoming-call', {
-          callId,
+          socket.emit('incoming-call', {
+            callId,
           fromUserId: callerId,
-          callType: callData.callType || 'video',
-          rtpCapabilities: callData.router.rtpCapabilities,
+            callType: callData.callType || 'video',
+            rtpCapabilities: callData.router.rtpCapabilities,
           participants: allParticipants,
           ...(callData.participantsInfo ? { participantsInfo: callData.participantsInfo } : {}),
           ...(callerFirstName ? { callerFirstName } : {}),
           ...(callerLastName ? { callerLastName } : {}),
           ...(callerName ? { callerName } : {}),
-        });
+          });
         callData.incomingCallSentMap.set(userId, true);
-        console.log('📤 [SERVER] Resent incoming-call event to reconnected user', userId, 'for call', callId);
+          console.log('📤 [SERVER] Resent incoming-call event to reconnected user', userId, 'for call', callId);
 
         // Ensure timeout is still enforced after reconnect.
         scheduleInviteTimeout({ io, callId, callData, inviteeId: userId, inviterId: callerId });
@@ -686,14 +705,14 @@ io.on('connection', socket => {
       // Send incoming-call to all participants
       for (const toUserId of participantIds) {
         console.log('📤 [SERVER] Processing participant', toUserId);
-        const calleeSocket = userSockets.get(toUserId);
+      const calleeSocket = userSockets.get(toUserId);
         console.log('📤 [SERVER] Callee socket lookup', { 
           toUserId, 
           hasSocket: !!calleeSocket,
           socketId: calleeSocket 
         });
         
-        if (calleeSocket) {
+      if (calleeSocket) {
           // Participant is online - send via socket
           console.log('📤 [SERVER] Sending incoming-call to', toUserId, 'via socket', calleeSocket);
           
@@ -714,17 +733,17 @@ io.on('connection', socket => {
             }
           }
           
-          io.to(calleeSocket).emit('incoming-call', {
-            callId,
-            fromUserId: socket.userId,
-            callType,
-            rtpCapabilities: router.rtpCapabilities,
+        io.to(calleeSocket).emit('incoming-call', {
+          callId,
+          fromUserId: socket.userId,
+          callType,
+          rtpCapabilities: router.rtpCapabilities,
             participants: [socket.userId, ...participantIds],
             ...(callData.participantsInfo ? { participantsInfo: callData.participantsInfo } : {}),
             ...(callerFirstName ? { callerFirstName } : {}),
             ...(callerLastName ? { callerLastName } : {}),
             ...(callerName ? { callerName } : {}),
-          });
+        });
           callData.incomingCallSentMap.set(toUserId, true);
           console.log('✅ [SERVER] Incoming call sent to participant via socket', toUserId);
           scheduleInviteTimeout({ io, callId, callData, inviteeId: toUserId, inviterId: socket.userId });
@@ -893,14 +912,17 @@ io.on('connection', socket => {
       // Create or reuse peer entry (idempotent)
       const existingPeer = callData.peers.get(socket.userId);
       if (!existingPeer) {
-        callData.peers.set(socket.userId, {
+      callData.peers.set(socket.userId, {
           transports: new Map(), // Map<transportId, transport>
           sendTransport: null,
           recvTransport: null,
           sendTransportParams: null,
           recvTransportParams: null,
-          producers: new Map(),
-          consumers: new Map(),
+        producers: new Map(),
+          // Producer metadata to disambiguate camera vs screen share, etc.
+          // Map<producerId, { source?: 'camera' | 'screen' | string }>
+          producerMeta: new Map(),
+        consumers: new Map(),
           joinedAt: Date.now(),
         });
         console.log('✅ [SERVER] Participant joined call (peer registered)', { callId, userId: socket.userId });
@@ -1017,7 +1039,8 @@ io.on('connection', socket => {
         if (uid === socket.userId) continue;
         if (peer?.producers?.size) {
           peer.producers.forEach((producer, producerId) => {
-            producers.push({ producerId, kind: producer.kind, userId: uid });
+            const meta = peer?.producerMeta?.get?.(producerId) || null;
+            producers.push({ producerId, kind: producer.kind, userId: uid, source: meta?.source || null });
           });
         }
       }
@@ -1077,7 +1100,7 @@ io.on('connection', socket => {
   });
 
   /* ---------- PRODUCE ---------- */
-  socket.on('create-producer', async ({ callId, kind, rtpParameters }, cb) => {
+  socket.on('create-producer', async ({ callId, kind, rtpParameters, appData }, cb) => {
     try {
       const callData = activeCalls.get(callId);
       const peer = callData?.peers.get(socket.userId);
@@ -1089,11 +1112,34 @@ io.on('connection', socket => {
       }
 
       console.log('📤 [SERVER] Media received from user', socket.userId, '- Kind:', kind);
-      slog('create-producer', { callId, userId: socket.userId, kind });
+      const source = (appData && typeof appData === 'object' ? appData.source : null) || null;
+      slog('create-producer', { callId, userId: socket.userId, kind, source });
+
+      // Enforce single active screen share per call
+      if (source === 'screen') {
+        const active = getActiveScreenShare(callData);
+        if (active && _toNumOrStr(active.userId) !== _toNumOrStr(socket.userId)) {
+          slog('create-producer.denied.screen_already_active', {
+            callId,
+            userId: socket.userId,
+            activeUserId: active.userId,
+            activeProducerId: active.producerId,
+          });
+          return cb({ error: 'Someone else is already sharing their screen. Ask them to stop, then you can share.' });
+        }
+      }
+
       const producer = await peer.sendTransport.produce({ kind, rtpParameters });
       peer.producers.set(producer.id, producer);
+      try {
+        if (!peer.producerMeta) peer.producerMeta = new Map();
+        peer.producerMeta.set(producer.id, { source });
+      } catch (e) {}
+      if (source === 'screen') {
+        callData.activeScreenShare = { producerId: producer.id, userId: socket.userId };
+      }
       console.log('✅ [SERVER] Producer created - ID:', producer.id, 'Kind:', kind, 'Media is being sent from user', socket.userId);
-      slog('create-producer.ok', { callId, userId: socket.userId, kind, producerId: producer.id });
+      slog('create-producer.ok', { callId, userId: socket.userId, kind, source, producerId: producer.id });
 
       scheduleStatsProbe(callData, {
         label: 'after create-producer',
@@ -1115,6 +1161,7 @@ io.on('connection', socket => {
               producerId: producer.id,
               kind: producer.kind,
               userId: socket.userId, // ✅ Add userId to new-producer event
+              source,
             });
             console.log('📤 [SERVER] Sent new-producer to participant', uid, 'from', socket.userId, 'kind:', producer.kind);
           }
@@ -1125,6 +1172,43 @@ io.on('connection', socket => {
     } catch (e) {
       slog('create-producer.exception', { callId, userId: socket.userId, kind, error: e?.message || String(e) });
       cb({ error: e.message });
+    }
+  });
+
+  /* ---------- CLOSE PRODUCER (e.g., stop screenshare) ---------- */
+  socket.on('close-producer', async ({ callId, producerId }, cb) => {
+    try {
+      const callData = activeCalls.get(callId);
+      const peer = callData?.peers.get(socket.userId);
+      if (!callData || !peer) return cb?.({ error: 'Call/peer not found' });
+
+      const producer = peer?.producers?.get?.(producerId);
+      if (!producer) return cb?.({ error: 'Producer not found' });
+
+      const meta = peer?.producerMeta?.get?.(producerId) || null;
+      const source = meta?.source || null;
+      const kind = producer?.kind || null;
+
+      try { producer.close(); } catch (e) {}
+      try { peer.producers.delete(producerId); } catch (e) {}
+      try { peer.producerMeta?.delete?.(producerId); } catch (e) {}
+      if (source === 'screen') {
+        clearActiveScreenShare(callData, producerId);
+      }
+
+      // Inform other peers so they can remove UI tiles/consumers.
+      for (const [uid] of callData.peers) {
+        if (uid !== socket.userId) {
+          const sid = userSockets.get(uid);
+          if (sid) {
+            io.to(sid).emit('producer-closed', { callId, producerId, userId: socket.userId, kind, source });
+          }
+        }
+      }
+
+      cb?.({ success: true });
+    } catch (e) {
+      cb?.({ error: e?.message || String(e) });
     }
   });
 
@@ -1385,6 +1469,14 @@ io.on('connection', socket => {
 
       console.log('🚪 [SERVER] User leaving call', { callId, userId: socket.userId });
 
+      // If this user was actively sharing their screen, clear the lock.
+      try {
+        const active = getActiveScreenShare(callData);
+        if (active && _toNumOrStr(active.userId) === _toNumOrStr(socket.userId)) {
+          callData.activeScreenShare = null;
+        }
+      } catch {}
+
       // Remove from joined peers and targets (so they cannot rejoin without being invited again).
       callData.peers.delete(socket.userId);
       removeParticipantFromTargets(callData, socket.userId);
@@ -1545,9 +1637,9 @@ io.on('connection', socket => {
       // Clean up any active calls this user was part of (treat as leave-call; do NOT end call for everyone)
       for (const [callId, callData] of activeCalls.entries()) {
         if (callData.peers.has(socket.userId)) {
-          try {
-            const peer = callData.peers.get(socket.userId);
-            callData.peers.delete(socket.userId);
+            try {
+              const peer = callData.peers.get(socket.userId);
+              callData.peers.delete(socket.userId);
             removeParticipantFromTargets(callData, socket.userId);
             try { callData.accepted?.delete?.(socket.userId); } catch {}
             clearInviteTimer(callData, socket.userId);
@@ -1556,7 +1648,7 @@ io.on('connection', socket => {
             cleanupPeerResources(socket.userId, peer);
 
             maybeEndCallIfSolo({ io, callId, callData });
-          } catch (e) {
+              } catch (e) {
             console.warn('⚠️ [SERVER] Error handling disconnect leave-call:', e?.message || e);
           }
         }

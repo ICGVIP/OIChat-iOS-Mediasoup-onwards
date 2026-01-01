@@ -1,5 +1,5 @@
 import React, {useState,useRef,useEffect, useCallback, useMemo} from 'react'
-import {View,Text, StyleSheet, ImageBackground, TouchableOpacity,Dimensions, Alert, SafeAreaView, Animated, PanResponder, ActivityIndicator, Platform, useColorScheme, TextInput, ScrollView, Image, Pressable, FlatList} from 'react-native';
+import {View,Text, StyleSheet, ImageBackground, TouchableOpacity,Dimensions, Alert, SafeAreaView, Animated, PanResponder, ActivityIndicator, Platform, useColorScheme, TextInput, ScrollView, Image, Pressable, FlatList, NativeModules, findNodeHandle} from 'react-native';
 import Feather from '@expo/vector-icons/Feather';
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
@@ -9,7 +9,7 @@ import AntDesign from '@expo/vector-icons/AntDesign';
 import FontAwesome5 from '@expo/vector-icons/FontAwesome5';
 import { Avatar } from 'react-native-paper';
 import {useSelector} from 'react-redux';
-import {RTCView, mediaDevices} from 'react-native-webrtc'
+import {RTCView, mediaDevices, ScreenCapturePickerView} from 'react-native-webrtc'
 import { useRTC } from '../../../context/rtc';
 import InCallManager from 'react-native-incall-manager';
 import { Socket } from 'socket.io-client';
@@ -202,7 +202,18 @@ const VideoCall = ({navigation}) => {
         participantsList, // Array of participants for group calls
         callInfo, // Call information
         addParticipantsToCall, // Function to add members to call
+        // Screen share (ReplayKit / getDisplayMedia)
+        activeScreenShare,
+        isStartingScreenShare,
+        startScreenShare,
+        stopScreenShare,
     } = useRTC();
+
+    // If call state is already torn down (e.g., remote hung up and endCall() is popping the stack),
+    // avoid briefly rendering the 1:1 "Audio Call" fallback with default name.
+    if (!info?.callId && !localStream && !remoteStream && (!participantsList || participantsList.length === 0)) {
+        return <></>;
+    }
     let [video, setVideo] = useState(info?.type=='video');
     let [mic, setMic] = useState(true);
     let [isMenuOpen, setMenuOpen] = useState(false);
@@ -226,6 +237,7 @@ const VideoCall = ({navigation}) => {
     
     // Bottom sheet ref and snap points
     const bottomSheetModalRef = useRef(null);
+    const screenPickerRef = useRef(null);
     const screenHeight = Dimensions.get('window').height;
     // Calculate height to reach top edge of pillTop: insets.top + 10 (marginTop) + 44 (icon height) + some padding
     const snapPoints = useMemo(() => {
@@ -403,7 +415,11 @@ const VideoCall = ({navigation}) => {
         } catch {}
     }, [callIdForReactions]);
 
-    const isGroupUI = ((participantsList && participantsList.length > 2) || (callInfo?.participantCount && callInfo.participantCount > 2));
+    // IMPORTANT: must be a boolean (avoid `{isGroupUI && ...}` rendering `0` and crashing with
+    // "Text strings must be rendered within a Text component.")
+    const isGroupUI =
+        !!((participantsList && participantsList.length > 2) ||
+        (typeof callInfo?.participantCount === 'number' && callInfo.participantCount > 2));
 
     // For 1:1 UI, show the most recent reaction (from either user) at top-center below pillTop.
     const latestReactionEmoji = useMemo(() => {
@@ -505,6 +521,11 @@ const VideoCall = ({navigation}) => {
   
     const handleEndCall = async () => {
         try{
+            // Ensure screen share stops when hanging up (in addition to RTC endCall cleanup).
+            try {
+                await stopScreenShare?.();
+            } catch (e) {}
+
             // CRITICAL: End CallKeep call FIRST (before stopping tracks)
             // This ensures CallKit releases the audio/video session properly
             try {
@@ -643,7 +664,9 @@ const VideoCall = ({navigation}) => {
 
     const handleMinimize = () => {
         console.log('📱 Minimize button pressed - PiP mode');
-        // PiP functionality - to be implemented
+        // Avoid calling startIOSPIP/stopIOSPIP (can crash on some RN bridgeless/UIManager queue paths).
+        // We rely on iosPIP.startAutomatically when the app backgrounds.
+        Alert.alert('Picture in Picture', 'Swipe up to go Home to start PiP.');
     };
 
     const handleMenuDots = useCallback(() => {
@@ -665,9 +688,36 @@ const VideoCall = ({navigation}) => {
         bottomSheetModalRef.current?.dismiss();
     };
 
-    const handleShareScreen = () => {
-        console.log('📱 Share Screen pressed');
-        bottomSheetModalRef.current?.dismiss();
+    const _showReplayKitPicker = () => {
+        try {
+            const tag = findNodeHandle(screenPickerRef.current);
+            if (!tag) return false;
+            NativeModules?.ScreenCapturePickerViewManager?.show?.(tag);
+            return true;
+                            } catch (e) {
+            return false;
+        }
+    };
+
+    const handleShareScreen = async () => {
+        try {
+            // Must be user-initiated: trigger ReplayKit Broadcast Picker.
+            _showReplayKitPicker();
+            bottomSheetModalRef.current?.dismiss();
+            await startScreenShare();
+        } catch (e) {
+            console.error('❌ [VideoCall] handleShareScreen failed', e?.message || e);
+            Alert.alert('Error', e?.message || 'Failed to start screen sharing');
+        }
+    };
+
+    const handleStopShareScreen = async () => {
+        try {
+            bottomSheetModalRef.current?.dismiss();
+            await stopScreenShare();
+        } catch (e) {
+            console.error('❌ [VideoCall] handleStopShareScreen failed', e?.message || e);
+        }
     };
 
     const handleAddMembers = () => {
@@ -710,8 +760,15 @@ const VideoCall = ({navigation}) => {
         setStreamsSwapped(!streamsSwapped);
     };
 
+    // NOTE:
+    // We rely on `iosPIP.startAutomatically` / `iosPIP.stopAutomatically` for PiP lifecycle.
+
     return(
         <SafeAreaView style={{ flex: 1, backgroundColor: 'black' }}>
+            {/* Hidden ReplayKit Broadcast Picker host view (required for iOS screen sharing) */}
+            <View style={{ position: 'absolute', width: 1, height: 1, opacity: 0 }}>
+                <ScreenCapturePickerView ref={screenPickerRef} />
+            </View>
 
             {/*Upper Actions - Hangup and Minimize */}
             <View style={styles.pillTop}>
@@ -733,6 +790,47 @@ const VideoCall = ({navigation}) => {
                 </TouchableOpacity>
             </View>
 
+            {/* Screen Share (Pinned / Presentation Tile) - show to viewers only (not the presenter).
+                1:1 layout handles screen share separately to avoid being covered by absoluteFill RTCViews. */}
+            {isGroupUI && !activeScreenShare?.isLocal && !!activeScreenShare?.stream && typeof activeScreenShare.stream?.toURL === 'function' && (
+                <View style={{
+                    width: windowWidth,
+                    alignSelf: 'center',
+                    marginTop: 6,
+                    marginBottom: 8,
+                    borderRadius: 14,
+                    overflow: 'hidden',
+                    backgroundColor: 'rgba(0,0,0,0.85)',
+                }}>
+                    <RTCView
+                        key={`screenshare-${activeScreenShare?.isLocal ? 'local' : 'remote'}-${activeScreenShare?.userId}-${activeScreenShare?.stream?.id || 's'}`}
+                        streamURL={activeScreenShare.stream.toURL()}
+                        objectFit="contain"
+                        style={{
+                            width: windowWidth,
+                            height: Math.min(
+                                windowHeight * 0.62,
+                                windowWidth / (activeScreenShare?.aspectRatio || (16 / 9))
+                            ),
+                            backgroundColor: 'black',
+                        }}
+                        zOrder={20}
+                        mirror={false}
+                    />
+                    <View style={{
+                        position: 'absolute',
+                        left: 10,
+                        top: 10,
+                        backgroundColor: 'rgba(0,0,0,0.35)',
+                        paddingHorizontal: 10,
+                        paddingVertical: 6,
+                        borderRadius: 14,
+                    }}>
+                        <Text style={{ color: 'white', fontWeight: '600' }}>Screen share</Text>
+                    </View>
+                </View>
+            )}
+
             {/*Upper Actions - Video/Audio Content*/}
             {isGroupUI ? (
                 <GroupCallView 
@@ -745,6 +843,119 @@ const VideoCall = ({navigation}) => {
                 />
             ) : (
                 <>
+                    {/* 1:1 Screen Share Layout (viewer only, not the presenter) */}
+                    {(!isGroupUI && !activeScreenShare?.isLocal && !!activeScreenShare?.stream && typeof activeScreenShare.stream?.toURL === 'function') ? (
+                        (() => {
+                            const gridPadding = 12;
+                            const gridGap = 10;
+                            const tileWidth = (windowWidth - (gridPadding * 2) - gridGap) / 2;
+                            const tileHeight = tileWidth * 1.35;
+
+                            const remoteDisplayName = (() => {
+                                const full = `${firstName || ''} ${lastName || ''}`.trim();
+                                return (full || name || 'Unknown').trim() || 'Unknown';
+                            })();
+
+                            const titleBase = remoteDisplayName;
+                            const title = (titleBase.endsWith('s') ? `${titleBase}' Screen` : `${titleBase}'s Screen`);
+
+                            const aspect = activeScreenShare?.aspectRatio || (16 / 9);
+                            const shareHeight = Math.min(windowHeight * 0.62, windowWidth / aspect);
+
+                            const hasRemoteVideoTrack = !!remoteStream && (remoteStream.getVideoTracks?.()?.length || 0) > 0;
+                            const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
+
+                            return (
+                                <View style={{ flex: 1 }}>
+                                    {/* Presentation tile */}
+                                    <View style={{
+                                        width: windowWidth,
+                                        alignSelf: 'center',
+                                        marginTop: 6,
+                                        marginBottom: 12,
+                                        borderRadius: 14,
+                                        overflow: 'hidden',
+                                        backgroundColor: 'rgba(0,0,0,0.85)',
+                                    }}>
+                                <RTCView
+                                            key={`screenshare-1to1-${activeScreenShare?.isLocal ? 'local' : 'remote'}-${activeScreenShare?.userId}-${activeScreenShare?.stream?.id || 's'}`}
+                                            streamURL={activeScreenShare.stream.toURL()}
+                                            objectFit="contain"
+                                            style={{
+                                                width: windowWidth,
+                                                height: shareHeight,
+                                                backgroundColor: 'black',
+                                            }}
+                                            zOrder={20}
+                                            mirror={false}
+                                        />
+                                        <View style={{
+                                            position: 'absolute',
+                                            left: 10,
+                                            top: 10,
+                                            backgroundColor: 'rgba(0,0,0,0.35)',
+                                            paddingHorizontal: 10,
+                                            paddingVertical: 6,
+                                            borderRadius: 14,
+                                        }}>
+                                            <Text style={{ color: 'white', fontWeight: '700' }}>{title}</Text>
+                                        </View>
+                                        {/* Viewer-only tile; presenter sees a small status pill near controls instead */}
+                                    </View>
+
+                                    {/* Below: remote camera tile (group-like size) */}
+                                    <View style={{ paddingHorizontal: gridPadding }}>
+                                        <View style={{
+                                            width: tileWidth,
+                                            height: tileHeight,
+                                            borderRadius: 16,
+                                            overflow: 'hidden',
+                                            backgroundColor: 'rgb(25,25,25)',
+                                        }}>
+                                            {canRenderRemote ? (
+                                                <RTCView
+                                                    key={`remote-tile-${remoteStream.id}-${remoteStreamTracksCount}`}
+                                                    streamURL={remoteStream.toURL()}
+                                    objectFit="cover"
+                                    style={StyleSheet.absoluteFill}
+                                    zOrder={0}
+                                    mirror={false}
+                                />
+                                            ) : (
+                                                <View style={[StyleSheet.absoluteFill, { justifyContent: 'center', alignItems: 'center' }]}>
+                                                    <Avatar.Text
+                                                        size={56}
+                                                        label={(remoteDisplayName || 'U').slice(0, 1).toUpperCase()}
+                                                        style={{ backgroundColor: 'rgb(60,60,60)' }}
+                                                    />
+                                                    <Text style={{ color: 'white', marginTop: 8, fontWeight: '700' }} numberOfLines={1}>
+                                                        {remoteDisplayName}
+                                                    </Text>
+                                                    <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 4 }}>
+                                                        {remoteVideoMuted ? 'Video is off' : 'Connecting…'}
+                                                    </Text>
+                                                </View>
+                                            )}
+                                            <View style={{
+                                                position: 'absolute',
+                                                left: 8,
+                                                bottom: 8,
+                                                backgroundColor: 'rgba(0,0,0,0.35)',
+                                                paddingHorizontal: 8,
+                                                paddingVertical: 4,
+                                                borderRadius: 12,
+                                            }}>
+                                                <Text style={{ color: 'white', fontWeight: '700' }} numberOfLines={1}>
+                                                    {remoteDisplayName}
+                                                </Text>
+                                            </View>
+                                        </View>
+                                    </View>
+                                </View>
+                            );
+                        })()
+                    ) : null}
+
                     {/* 1:1 Reaction (top-center, below pillTop) */}
                     {!!latestReactionEmoji && (
                         <View style={{
@@ -762,7 +973,10 @@ const VideoCall = ({navigation}) => {
                         </View>
                     )}
 
-                    {info?.type === 'video' ? (
+                    {/* If screen share is active in 1:1:
+                        - viewers: we already rendered the viewer-specific layout above, so skip default 1:1 UI
+                        - presenter: keep the normal 1:1 UI (do NOT go black) */}
+                    {(!activeScreenShare?.stream || activeScreenShare?.isLocal || isGroupUI) ? (info?.type === 'video' ? (
                         <>
                             {/* existing 1:1 video UI stays as-is below */}
                             {/* ✅ Full Screen Video - Swaps between local and remote based on streamsSwapped state */}
@@ -774,40 +988,40 @@ const VideoCall = ({navigation}) => {
                                         const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
 
                                         if (canRenderRemote) {
-                                            return (
-                                                <RTCView
+                            return (
+                                <RTCView
                                                     key={`remote-${remoteStream.id}-${remoteStreamTracksCount}`}
                                                     streamURL={remoteStream.toURL()}
-                                                    objectFit="cover"
-                                                    style={StyleSheet.absoluteFill}
-                                                    zOrder={0}
-                                                    mirror={false}
-                                                />
-                                            );
-                                        }
+                                    objectFit="cover"
+                                    style={StyleSheet.absoluteFill}
+                                    zOrder={0}
+                                    mirror={false}
+                                />
+                            );
+                        }
 
                                         const statusText = remoteVideoMuted ? 'Video is off' : 'Connecting…';
-                                        return (
-                                            <View style={[
-                                                StyleSheet.absoluteFill, 
-                                                { 
-                                                    justifyContent: 'center', 
-                                                    alignItems: 'center', 
-                                                    backgroundColor: '#111',
-                                                    zIndex: 2,
-                                                    elevation: 2,
-                                                }
-                                            ]}>
-                                                <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
+                            return (
+                                <View style={[
+                                    StyleSheet.absoluteFill, 
+                                    { 
+                                        justifyContent: 'center', 
+                                        alignItems: 'center', 
+                                        backgroundColor: '#111',
+                                        zIndex: 2,
+                                        elevation: 2,
+                                    }
+                                ]}>
+                                    <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
                                                 <Text style={{ color: 'white', marginTop: 12, fontSize: 16 }}>
                                                     {firstName && lastName 
                                                         ? `${firstName} ${lastName}`
                                                         : name}
                                                 </Text>
                                                 <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 4, fontSize: 14 }}>{statusText}</Text>
-                                            </View>
-                                        );
-                                    })()}
+                                </View>
+                            );
+                    })()}
                                 </>
                             ) : (
                                 <>
@@ -841,16 +1055,16 @@ const VideoCall = ({navigation}) => {
                                 </>
                             )}
 
-                            {/* ✅ Remote mic muted notice at top */}
+                    {/* ✅ Remote mic muted notice at top */}
                             {remoteMicMuted && (
-                                <View style={{
-                                    position: 'absolute',
-                                    top: insets.top + 10,
-                                    alignSelf: 'center',
-                                    backgroundColor: 'rgba(0,0,0,0.6)',
-                                    paddingHorizontal: 12,
-                                    paddingVertical: 6,
-                                    borderRadius: 20,
+                    <View style={{
+                        position: 'absolute',
+                        top: insets.top + 10,
+                        alignSelf: 'center',
+                        backgroundColor: 'rgba(0,0,0,0.6)',
+                        paddingHorizontal: 12,
+                        paddingVertical: 6,
+                        borderRadius: 20,
                                     zIndex: 100,
                                     elevation: 100,
                                 }}>
@@ -859,60 +1073,60 @@ const VideoCall = ({navigation}) => {
                                             ? `${firstName} ${lastName} is muted`
                                             : (info?.name || name || 'User') + ' is muted'}
                                     </Text>
-                                </View>
-                            )}
+                    </View>
+                    )}
 
                             {/* ✅ Small Preview - Swaps between local and remote based on streamsSwapped state */}
                             <TouchableOpacity 
                                 activeOpacity={0.8}
                                 onPress={() => setStreamsSwapped(!streamsSwapped)}
                                 style={{
-                                    position: 'absolute',
+                        position: 'absolute',
                                     top: insets.top + 10 + 44 + 20,
-                                    right: 20,
-                                    width: windowWidth * 0.3,
-                                    height: windowWidth * 0.45,
-                                    backgroundColor: '#000',
-                                    borderRadius: 10,
-                                    overflow: 'hidden',
-                                    zIndex: 10,
-                                    justifyContent: 'center',
-                                    alignItems: 'center',
+                        right: 20,
+                        width: windowWidth * 0.3,
+                        height: windowWidth * 0.45,
+                        backgroundColor: '#000',
+                        borderRadius: 10,
+                        overflow: 'hidden',
+                        zIndex: 10,
+                        justifyContent: 'center',
+                        alignItems: 'center',
                                 }}
                             >
                                 {!streamsSwapped ? (
                                     <>
                                         {/* Local video small preview */}
-                                        {video ? (
-                                            <RTCView
+                        {video ? (
+                        <RTCView
                                                 streamURL={localStream?.toURL()}
-                                                objectFit="cover"
-                                                style={{ width: '100%', height: '100%' }}
+                            objectFit="cover"
+                            style={{ width: '100%', height: '100%' }}
                                                 mirror={true}
-                                            />
-                                        ) : (
-                                            <View style={{
-                                                ...StyleSheet.absoluteFillObject,
-                                                backgroundColor: 'rgba(255,255,255,0.5)',
-                                                justifyContent: 'center',
-                                                alignItems: 'center',
-                                            }}>
-                                                <Feather name="video-off" size={28} color="#444" />
-                                            </View>
-                                        )}
+                        />
+                        ) : (
+                        <View style={{
+                            ...StyleSheet.absoluteFillObject,
+                            backgroundColor: 'rgba(255,255,255,0.5)',
+                            justifyContent: 'center',
+                            alignItems: 'center',
+                        }}>
+                            <Feather name="video-off" size={28} color="#444" />
+                        </View>
+                        )}
 
-                                        {video && !mic && (
-                                            <View style={{
-                                                position: 'absolute',
-                                                bottom: 6,
-                                                alignSelf: 'center',
-                                                backgroundColor: 'rgba(0,0,0,0.6)',
-                                                padding: 4,
-                                                borderRadius: 20,
-                                            }}>
-                                                <Feather name="mic-off" size={20} color="white" />
-                                            </View>
-                                        )}
+                        {video && !mic && (
+                        <View style={{
+                            position: 'absolute',
+                            bottom: 6,
+                            alignSelf: 'center',
+                            backgroundColor: 'rgba(0,0,0,0.6)',
+                            padding: 4,
+                            borderRadius: 20,
+                        }}>
+                            <Feather name="mic-off" size={20} color="white" />
+                        </View>
+                        )}
                                     </>
                                 ) : (
                                     <>
@@ -948,58 +1162,87 @@ const VideoCall = ({navigation}) => {
                                                     <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 2, fontSize: 11 }}>
                                                         {statusText}
                                                     </Text>
-                                                </View>
+                    </View>
                                             );
                                         })()}
                                     </>
-                                )}
-                            </TouchableOpacity>
-                        </>
-                    ) : (
-                        <>
-                            {/* Audio call fallback (1:1) */}
-                            <View style={{ ...StyleSheet.absoluteFill, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgb(46,49,61)' }}>
-                                <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
-                                <Text style={{ fontSize: 22, fontWeight: 'bold', color: 'white', marginTop: 20 }}>{name}</Text>
-                                <Text style={{ fontSize: 16, color: 'white', marginTop: 10 }}>Audio Call</Text>
-                            </View>
-                        </>
                     )}
+                            </TouchableOpacity>
                 </>
+                ) : (
+                    <>
+                            {/* Audio call fallback (1:1) */}
+                        <View style={{ ...StyleSheet.absoluteFill, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgb(46,49,61)' }}>
+                            <Avatar.Image size={100} source={{ uri: pic || 'https://via.placeholder.com/100' }} />
+                            <Text style={{ fontSize: 22, fontWeight: 'bold', color: 'white', marginTop: 20 }}>{name}</Text>
+                            <Text style={{ fontSize: 16, color: 'white', marginTop: 10 }}>Audio Call</Text>
+                        </View>
+                        </>
+                    )) : null}
+                    </>
             )}
 
             {/* Call Controls */}
             <View style={[styles.controlsWrapper, { paddingBottom: insets.bottom + 10 }]}>
-                {/* Flip Camera Button - Above Call Controls */}
+                {/* Row above call controls: left = "Screen is being shared" (presenter-only), right = flip camera */}
                 {info?.type === 'video' && (
-                    <View style={{ alignSelf: 'flex-end', marginRight: (windowWidth - windowWidth * 0.85) / 2, marginBottom: 15 }}>
-                    <TouchableOpacity onPress={flipCamera}>
-                            <Avatar.Icon 
-                                size={46} 
-                                style={styles.circle} 
-                                icon={() => (
-                                    <Ionicons name="camera-reverse-outline" size={26} color="black" />
-                                )} 
-                            />
+                    <View style={{
+                        width: windowWidth * 0.85,
+                        alignSelf: 'center',
+                        flexDirection: 'row',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        marginBottom: 15,
+                    }}>
+                        <View style={{ flex: 1, alignItems: 'flex-start' }}>
+                            {!!activeScreenShare?.isLocal && (
+                                <TouchableOpacity
+                                    onPress={handleStopShareScreen}
+                                    activeOpacity={0.8}
+                                    style={{
+                                        backgroundColor: 'black',
+                                        paddingHorizontal: 12,
+                                        paddingVertical: 6,
+                                        borderRadius: 20,
+                                        flexDirection: 'row',
+                                        alignItems: 'center',
+                                        gap: 8,
+                                    }}
+                                >
+                                    <Text style={{ color: 'white', fontSize: 13, fontWeight: '700' }}>Screen is being shared</Text>
+                                    <MaterialIcons name="stop" size={16} color="#ff3b30" />
                     </TouchableOpacity>
+                )}
+                        </View>
+                        <View style={{ width: 46, alignItems: 'flex-end' }}>
+                            <TouchableOpacity onPress={flipCamera}>
+                                <Avatar.Icon 
+                                    size={46} 
+                                    style={styles.circle} 
+                                    icon={() => (
+                                        <Ionicons name="camera-reverse-outline" size={26} color="black" />
+                                    )} 
+                                />
+                </TouchableOpacity>
+                        </View>
                     </View>
                 )}
                 <View style={styles.pillBottom}>
                 
                 {info?.type === 'video' && (
-                    <TouchableOpacity onPress={toggleVideo}>
-                        <Avatar.Icon
-                        size={44}
-                        style={video ? styles.circle : styles.circle_disabled}
-                        icon={() =>
-                            video ? (
-                            <Ionicons name="videocam-outline" size={24} color="black" />
-                            ) : (
-                            <Feather name="video-off" size={20} color="white" />
-                            )
-                        }
-                        />
-                    </TouchableOpacity>
+                <TouchableOpacity onPress={toggleVideo}>
+                    <Avatar.Icon
+                    size={44}
+                    style={video ? styles.circle : styles.circle_disabled}
+                    icon={() =>
+                        video ? (
+                        <Ionicons name="videocam-outline" size={24} color="black" />
+                        ) : (
+                        <Feather name="video-off" size={20} color="white" />
+                        )
+                    }
+                    />
+                </TouchableOpacity>
                 )}
                 <TouchableOpacity onPress={toggleAudio}>
                     <Avatar.Icon
@@ -1108,7 +1351,25 @@ const VideoCall = ({navigation}) => {
                                 <Text style={{...styles.option, color: colorScheme === 'dark' ? 'white' : 'black'}}>Send Message</Text>
                             </TouchableOpacity>
 
-                            <TouchableOpacity style={styles.menuOption} onPress={handleShareScreen}>
+                            <TouchableOpacity
+                                style={styles.menuOption}
+                                onPress={() => {
+                                    // Single active screen share per call.
+                                    if (activeScreenShare?.stream && !activeScreenShare?.isLocal) {
+                                        Alert.alert(
+                                            'Screen Sharing Unavailable',
+                                            'Someone else is already sharing their screen. Ask them to stop, then you can share.'
+                                        );
+                                        return;
+                                    }
+                                    if (activeScreenShare?.isLocal) {
+                                        handleStopShareScreen();
+                                    } else {
+                                        handleShareScreen();
+                                    }
+                                }}
+                                disabled={isStartingScreenShare}
+                            >
                                 <View style={{
                                     height: 40,
                                     width: 40,
@@ -1119,7 +1380,13 @@ const VideoCall = ({navigation}) => {
                                 }}>
                                     <MaterialIcons name="screen-share" size={26} color={colorScheme === 'light' ? 'rgb(182,186,185)' : 'white'} />
                                 </View>
-                                <Text style={{...styles.option, color: colorScheme === 'dark' ? 'white' : 'black'}}>Share Screen</Text>
+                                <Text style={{...styles.option, color: colorScheme === 'dark' ? 'white' : 'black'}}>
+                                    {activeScreenShare?.stream && !activeScreenShare?.isLocal
+                                        ? 'Share Screen'
+                                        : (activeScreenShare?.isLocal
+                                            ? 'Stop Screen Share'
+                                            : (isStartingScreenShare ? 'Starting…' : 'Share Screen'))}
+                                </Text>
                             </TouchableOpacity>
 
                             <TouchableOpacity style={styles.menuOption} onPress={handleAddMembers}>

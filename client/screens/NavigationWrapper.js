@@ -59,7 +59,7 @@ import SelfChatInfo from './Chats/sub-screens/SelfChatInfo';
 
 import ViewBlockedUsers from './Profile/sub-screens/ViewBlockedUsers';
 import Screen3 from './Screen3';
-import { flushNavQueue, navigate, navigationRef } from '../utils/staticNavigationutils';
+import { flushNavQueue, navigate, replace, navigationRef } from '../utils/staticNavigationutils';
 
 const Stack = createNativeStackNavigator();
 
@@ -144,8 +144,9 @@ const AuthContainer = () => {
       await waitForIncomingCallSetup();
       console.log('[CALLKEEP][NAV] incoming call setup ready, calling processAccept()...');
       await processAccept({ source: 'callkeep' });
-      console.log('[CALLKEEP][NAV] processAccept() finished, navigating to Video Call');
-      navigate('Video Call');
+      // processAccept() already transitions to Video Call via navigation helper.
+      // Avoid double navigation which can cause a brief "flash" / second navigation.
+      console.log('[CALLKEEP][NAV] processAccept() finished');
       } catch (err) {
         console.error('[NAV] Accept failed:', err);
         endCall();
@@ -292,14 +293,17 @@ const AuthContainer = () => {
               <Stack.Screen 
               name='Video Call'
               component={VideoCall}
+              options={{ gestureEnabled: false }}
               />
               <Stack.Screen 
                 name='Outgoing Call'
                 component = {OutgoingCall}
+                options={{ gestureEnabled: false }}
               />
               <Stack.Screen 
                 name='Incoming Call'
                 component={IncomingCall}
+                options={{ gestureEnabled: false }}
               />
               <Stack.Screen
               name='Demo'

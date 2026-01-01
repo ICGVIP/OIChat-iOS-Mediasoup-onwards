@@ -13,9 +13,10 @@ function hasSomethingToPopToTop(state) {
       const idx = typeof cur.index === 'number' ? cur.index : 0;
       const routes = Array.isArray(cur.routes) ? cur.routes : [];
 
-      // Only STACK navigators can handle POP_TO_TOP.
-      // Tabs/drawers will WARN "POP_TO_TOP was not handled by any navigator".
-      if ((cur.type === 'stack' || cur.type === 'native-stack') && idx > 0) return true;
+      // React Navigation state objects do not reliably expose a `type` field.
+      // We only need to know if there is a nested navigator with something to pop.
+      // (For call flows, we're inside a stack/native-stack; this prevents false negatives.)
+      if (idx > 0 && routes.length > 1) return true;
 
       // Try to descend into the currently focused route's nested state
       const focusedRoute = routes[idx] || routes[routes.length - 1];
@@ -30,7 +31,7 @@ function hasSomethingToPopToTop(state) {
 // Helper to check if we can safely navigate to a screen
 function canNavigateToScreen(name, userData) {
   // Screens available in authenticated navigator
-  const authScreens = ['Home', 'Profile', 'Edit Profile', 'Social Profile', 'Posts List', 'Flix List', 'Stories List', 'Solo Story Display', 'Archived', 'Notifications', 'Saved', 'New Chat', 'New Call', 'View Blocked Users', 'Chat Settings General', 'Account Settings', 'Security Settings', 'Deactivate', 'HelpnSupport', 'Contact Us'];
+  const authScreens = ['Home', 'Profile', 'Edit Profile', 'Social Profile', 'Posts List', 'Flix List', 'Stories List', 'Solo Story Display', 'Archived', 'Notifications', 'Saved', 'New Chat', 'New Call', 'View Blocked Users', 'Chat Settings General', 'Account Settings', 'Security Settings', 'Deactivate', 'HelpnSupport', 'Contact Us', 'Incoming Call', 'Outgoing Call', 'Video Call'];
   
   // Screens available in unauthenticated navigator
   const unauthScreens = ['Opening', 'Login', 'SignUp', 'Verify', 'Forgot Password', 'Money Transfer', 'Easy Chat', 'Screen 3'];
@@ -61,6 +62,35 @@ export function navigate(name, params = {}) {
   }
 }
 
+export function replace(name, params = {}) {
+  if (!navigationRef.isReady()) {
+    console.warn('Navigation not ready, queuing replace:', name);
+    navQueue.push({ type: 'replace', name, params });
+    return;
+  }
+  try {
+    navigationRef.dispatch(StackActions.replace(name, params));
+  } catch (error) {
+    console.warn(`Failed to replace to ${name}:`, error.message);
+  }
+}
+
+export function resetTo(name, params = {}) {
+  if (!navigationRef.isReady()) {
+    console.warn('Navigation not ready, queuing resetTo:', name);
+    navQueue.push({ type: 'resetTo', name, params });
+    return;
+  }
+  try {
+    navigationRef.reset({
+      index: 0,
+      routes: [{ name, params }],
+    });
+  } catch (error) {
+    console.warn(`Failed to resetTo ${name}:`, error.message);
+  }
+}
+
 export function safeNavigate(name, params = {}, userData) {
   // Check if navigation is safe before attempting
   if (!canNavigateToScreen(name, userData)) {
@@ -81,6 +111,14 @@ export function flushNavQueue(userData = null){
           // Filter to only include valid navigations for current state
           if (userData === null || canNavigateToScreen(action.name, userData)) {
             navigationRef.navigate(action.name, action.params);
+          }
+        } else if (action.type === 'replace') {
+          if (userData === null || canNavigateToScreen(action.name, userData)) {
+            navigationRef.dispatch(StackActions.replace(action.name, action.params));
+          }
+        } else if (action.type === 'resetTo') {
+          if (userData === null || canNavigateToScreen(action.name, userData)) {
+            navigationRef.reset({ index: 0, routes: [{ name: action.name, params: action.params }] });
           }
         } else if (action.type === 'popToTop') {
           popToTop();

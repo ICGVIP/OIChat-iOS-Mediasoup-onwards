@@ -11,7 +11,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform, AppState, Alert } from 'react-native';
 import { useSelector } from 'react-redux';
 import uuid from 'react-native-uuid';
-import { navigate, popToTop } from '../utils/staticNavigationutils';
+import { navigate, popToTop, replace, navigationRef } from '../utils/staticNavigationutils';
 import { ParticipantManager } from './participantManager';
 import { SoundManager } from './soundManager';
 import { StreamManager } from './streamManager';
@@ -72,7 +72,7 @@ export const RTCProvider = ({ children }) => {
   const sendTransport = useRef(null);
   const recvTransport = useRef(null);
   const producers = useRef(new Map());
-  const consumers = useRef(new Map()); // Map<producerId, { consumer, userId, kind }>
+  const consumers = useRef(new Map()); // Map<producerId, { consumer, userId, kind, source?: string }>
   const currentCallId = useRef(null);
   const remoteStreamRef = useRef(null); // Keep for 1:1 compatibility
   const lastRemoteStreamTracksCount = useRef(0); // Track last count to prevent unnecessary updates
@@ -81,6 +81,15 @@ export const RTCProvider = ({ children }) => {
   const consumingProducerIdsRef = useRef(new Set()); // Prevent duplicate consume() calls per producerId
   const pendingProducerQueueRef = useRef([]); // Queue new-producer events until recvTransport exists
   const callModeRef = useRef({ isGroupCall: false }); // Avoid relying on React state inside socket handlers
+  const screenProducerRef = useRef(null);
+  const localScreenStreamRef = useRef(null);
+
+  const [activeScreenShare, setActiveScreenShare] = useState(null); // { userId, stream, isLocal, aspectRatio }
+  const [isStartingScreenShare, setIsStartingScreenShare] = useState(false);
+  // iOS background behavior: camera capture usually stops when app backgrounds.
+  // We proactively signal "video off" so peers don't see a frozen frame.
+  const appStateRef = useRef(AppState.currentState || 'active');
+  const autoVideoMutedRef = useRef(false);
   // Map of { [userIdStr]: { firstName, lastName, username } } from calls server for non-contact name fallback.
   const participantsInfoRef = useRef({});
   const callUUID = useRef(null);
@@ -386,7 +395,7 @@ export const RTCProvider = ({ children }) => {
         ...(callerFirstName ? { callerFirstName } : {}),
         ...(callerLastName ? { callerLastName } : {}),
       });
-      navigate('Incoming Call');
+      replace('Incoming Call');
       
       // Ensure currentCallId is set (may have been set from AsyncStorage)
       if (currentCallId.current !== callId) {
@@ -435,7 +444,7 @@ export const RTCProvider = ({ children }) => {
         // InCallManager incoming ringtone disabled (CallKeep handles ringing)
         // InCallManager.startRingtone();
         setTimeout(() => {
-          navigate('Incoming Call');
+          replace('Incoming Call');
         }, 100);
       }
     });
@@ -449,7 +458,7 @@ export const RTCProvider = ({ children }) => {
         // For now, assume it's a video call if we're in VideoCall screen
       }
 
-      navigate('Video Call');
+      replace('Video Call');
 
       InCallManager.stopRingback();
       const callType = info.type || 'video';
@@ -457,7 +466,7 @@ export const RTCProvider = ({ children }) => {
     });
 
     /* ---------- NEW PRODUCER ---------- */
-    socket.current.on('new-producer', async ({ producerId, kind, userId }) => {
+    socket.current.on('new-producer', async ({ producerId, kind, userId, source }) => {
       
       if (!currentCallId.current) {
         
@@ -470,15 +479,36 @@ export const RTCProvider = ({ children }) => {
       }
       // If recv transport isn't ready yet, queue this producer and consume after we create recvTransport.
       if (!recvTransport.current) {
-        pendingProducerQueueRef.current.push({ producerId, userId });
-        rtcDbg('new-producer.queued', { producerId, kind, userId });
+        pendingProducerQueueRef.current.push({ producerId, userId, kind, source });
+        rtcDbg('new-producer.queued', { producerId, kind, userId, source });
         return;
       }
       try {
-        await consume(producerId, userId);
+        await consume(producerId, userId, source);
       } catch (e) {
-        console.error('❌ [RTC] consume() failed for new-producer', { producerId, kind, userId, error: e?.message || e });
+        console.error('❌ [RTC] consume() failed for new-producer', { producerId, kind, userId, source, error: e?.message || e });
       }
+    });
+
+    /* ---------- PRODUCER CLOSED (e.g., screen share stopped) ---------- */
+    socket.current.on('producer-closed', ({ callId, producerId, userId, kind, source }) => {
+      try {
+        if (callId && currentCallId.current && String(callId) !== String(currentCallId.current)) return;
+        const meta = consumers.current.get(producerId);
+        if (meta?.consumer) {
+          try { meta.consumer.close(); } catch (e) {}
+        }
+        consumers.current.delete(producerId);
+
+        if (source === 'screen') {
+          const uidStr = userId?.toString?.() ?? String(userId);
+          setActiveScreenShare((prev) => {
+            if (!prev) return prev;
+            if ((prev.userId?.toString?.() ?? String(prev.userId)) !== uidStr) return prev;
+            return null;
+          });
+        }
+      } catch (e) {}
     });
 
     /* ---------- CALL INVITATION (for participants added to existing call) ---------- */
@@ -516,7 +546,7 @@ export const RTCProvider = ({ children }) => {
           // ignore
         }
 
-        navigate('Incoming Call');
+        replace('Incoming Call');
       } catch (error) {
         console.error('❌ [RTC] Error handling call invitation:', error);
       }
@@ -695,6 +725,15 @@ export const RTCProvider = ({ children }) => {
         currentCallId.current = null;
         setInfo({});
         popToTop();
+        // If the call screens were reached via `replace()`, the stack may only contain the call screen.
+        // In that case popToTop() is a no-op and we'd be left rendering an empty VideoCall.
+        // Fall back to Home.
+        try {
+          const cur = navigationRef.getCurrentRoute?.()?.name;
+          if (cur === 'Video Call' || cur === 'Incoming Call' || cur === 'Outgoing Call') {
+            replace('Home');
+          }
+        } catch {}
       } catch (e) {
         // ignore
       }
@@ -785,6 +824,53 @@ export const RTCProvider = ({ children }) => {
 
     return () => socket.current?.disconnect();
   }, [user?.data?.id]);
+
+  // iOS: when app backgrounds (PiP), treat local camera as "video off" for remote peers via socket mute-video.
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return;
+
+    const sub = AppState.addEventListener('change', (nextState) => {
+      const prev = appStateRef.current;
+      appStateRef.current = nextState;
+
+      // Leaving foreground
+      if ((nextState === 'inactive' || nextState === 'background') && prev === 'active') {
+        try {
+          if (!currentCallId.current) return;
+          if ((info?.type || '') !== 'video') return;
+          const videoProducer = producers.current.get('video');
+          if (!videoProducer) return;
+
+          // Only auto-mute if video is currently ON (don't override manual mute).
+          if (videoStatus === false) return;
+
+          autoVideoMutedRef.current = true;
+          socket.current?.emit?.('mute-video', { callId: currentCallId.current, producerId: videoProducer.id, muted: true });
+          setVideoStatus(false);
+        } catch (e) {}
+      }
+
+      // Returning foreground
+      if (nextState === 'active' && (prev === 'inactive' || prev === 'background')) {
+        try {
+          if (!autoVideoMutedRef.current) return;
+          autoVideoMutedRef.current = false;
+
+          if (!currentCallId.current) return;
+          if ((info?.type || '') !== 'video') return;
+          const videoProducer = producers.current.get('video');
+          if (!videoProducer) return;
+
+          socket.current?.emit?.('mute-video', { callId: currentCallId.current, producerId: videoProducer.id, muted: false });
+          setVideoStatus(true);
+        } catch (e) {}
+      }
+    });
+
+    return () => {
+      try { sub?.remove?.(); } catch {}
+    };
+  }, [info?.type, videoStatus]);
 
   /* ================= DEVICE ================= */
 
@@ -1177,10 +1263,10 @@ export const RTCProvider = ({ children }) => {
       
     });
 
-    sendTransport.current.on('produce', ({ kind, rtpParameters }, cb, eb) => {
+    sendTransport.current.on('produce', ({ kind, rtpParameters, appData }, cb, eb) => {
 
       try {
-        rtcDbg('sendTransport.produce', { callId: currentCallId.current, transportId: params?.id, kind });
+        rtcDbg('sendTransport.produce', { callId: currentCallId.current, transportId: params?.id, kind, source: appData?.source });
         socket.current.emit(
           'create-producer',
           {
@@ -1188,6 +1274,7 @@ export const RTCProvider = ({ children }) => {
             transportId: params.id,
             kind,
             rtpParameters,
+            appData: appData && typeof appData === 'object' ? appData : undefined,
           },
           (response) => {
             if (response?.error) {
@@ -1282,7 +1369,7 @@ export const RTCProvider = ({ children }) => {
         rtcDbg('new-producer.queue.drain', { count: queued.length });
         for (const p of queued) {
           try {
-            await consume(p.producerId, p.userId);
+            await consume(p.producerId, p.userId, p?.source);
           } catch (e) {
             console.error('❌ [RTC] consume() failed (queued producer)', {
               producerId: p?.producerId,
@@ -1418,7 +1505,7 @@ export const RTCProvider = ({ children }) => {
 
   /* ================= CONSUME ================= */
 
-  const consume = async (producerId, userId) => {
+  const consume = async (producerId, userId, source) => {
     if (!recvTransport.current || !device.current) {
       return;
     }
@@ -1443,6 +1530,7 @@ export const RTCProvider = ({ children }) => {
     }
 
     const userIdStr = userId?.toString();
+    const sourceStr = source?.toString?.() ?? (source != null ? String(source) : null);
     
     // Avoid relying only on callModeRef (can be stale during late joins).
     const participantCount = participantManager.current?.getParticipantCount?.() || 0;
@@ -1488,6 +1576,7 @@ export const RTCProvider = ({ children }) => {
         consumer,
         userId: userIdStr,
         kind: consumer.kind,
+        source: sourceStr,
       });
     
       socket.current.emit('resume-consumer', {
@@ -1505,7 +1594,42 @@ export const RTCProvider = ({ children }) => {
       rtcDbg('consumer.resume.client_ok', { consumerId: consumer?.id, kind: consumer?.kind });
       
 
-    // Map consumer to participant
+    // If this is a screen share track, do NOT mix it into the participant camera stream.
+    // We render it separately as a pinned "presentation" tile.
+    if (sourceStr === 'screen' && consumer?.kind === 'video') {
+      try {
+        const track = consumer.track;
+        if (track) {
+          const s = new MediaStream();
+          s.addTrack(track);
+          let ar = null;
+          try {
+            const settings = track.getSettings?.();
+            if (settings?.width && settings?.height) {
+              ar = settings.width / settings.height;
+            }
+          } catch (e) {}
+
+          setActiveScreenShare({
+            userId: userIdStr,
+            stream: s,
+            isLocal: false,
+            aspectRatio: ar,
+          });
+
+          track.onended = () => {
+            setActiveScreenShare((prev) => {
+              if (!prev) return prev;
+              if ((prev.userId?.toString?.() ?? String(prev.userId)) !== userIdStr) return prev;
+              return null;
+            });
+          };
+        }
+      } catch (e) {}
+      return;
+    }
+
+    // Map consumer to participant (camera/audio)
     streamManager.current.mapConsumerToParticipant(producerId, userIdStr);
 
     // Add track to participant's stream.
@@ -1713,6 +1837,127 @@ export const RTCProvider = ({ children }) => {
     }
   };
 
+  /* ================= SCREEN SHARE ================= */
+
+  const startScreenShare = async () => {
+    if (isStartingScreenShare) return;
+    if (!currentCallId.current) {
+      Alert.alert('Error', 'No active call');
+      return;
+    }
+    if (!sendTransport.current) {
+      Alert.alert('Error', 'Call not ready yet');
+      return;
+    }
+    if (screenProducerRef.current) {
+      return; // already sharing
+    }
+    // Only one active screen share per call: if someone else is sharing, block locally with a friendly message.
+    if (activeScreenShare?.stream && !activeScreenShare?.isLocal) {
+      Alert.alert(
+        'Screen Sharing Unavailable',
+        'Someone else is already sharing their screen. Ask them to stop, then you can share.'
+      );
+      return;
+    }
+
+    setIsStartingScreenShare(true);
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const track = stream?.getVideoTracks?.()?.[0];
+      if (!track) {
+        throw new Error('No screen video track');
+      }
+
+      localScreenStreamRef.current = stream;
+
+      let ar = null;
+      try {
+        const settings = track.getSettings?.();
+        if (settings?.width && settings?.height) ar = settings.width / settings.height;
+      } catch (e) {}
+
+      try {
+        track.enabled = true;
+      } catch (e) {}
+
+      // Use the native-backed MediaStream returned by getDisplayMedia for local preview.
+      // (Derived streams can be flaky for ReplayKit tracks on iOS.)
+      const previewStream = stream;
+
+      setActiveScreenShare({
+        userId: user?.data?.id?.toString?.() ?? String(user?.data?.id),
+        stream: previewStream,
+        isLocal: true,
+        aspectRatio: ar,
+      });
+
+      // Force a rebind shortly after start — ReplayKit frames may begin a tick later, and RTCView can miss the first attach.
+      setTimeout(() => {
+        try {
+          if (!screenProducerRef.current) return;
+          setActiveScreenShare(prev => {
+            if (!prev?.isLocal) return prev;
+            // Re-assign to a fresh object to force RTCView remount keyed by stream id/props.
+            return { ...prev, stream: stream };
+          });
+        } catch (e) {}
+      }, 700);
+
+      const producer = await sendTransport.current.produce({
+        track,
+        appData: { source: 'screen' },
+      });
+      screenProducerRef.current = producer;
+
+      track.onended = () => {
+        stopScreenShare();
+      };
+
+      rtcDbg('screenshare.local.started', {
+        callId: currentCallId.current,
+        streamId: stream?.id,
+        trackId: track?.id,
+        enabled: track?.enabled,
+        muted: track?.muted,
+        readyState: track?.readyState,
+        settings: track?.getSettings?.() || null,
+      });
+    } catch (e) {
+      console.error('❌ [RTC] startScreenShare failed', e?.message || e);
+      Alert.alert('Error', e?.message || 'Failed to start screen sharing');
+      setActiveScreenShare((prev) => (prev?.isLocal ? null : prev));
+      try {
+        localScreenStreamRef.current?.getTracks?.()?.forEach?.((t) => t.stop?.());
+      } catch (err) {}
+      localScreenStreamRef.current = null;
+    } finally {
+      setIsStartingScreenShare(false);
+    }
+  };
+
+  const stopScreenShare = async () => {
+    try {
+      const producer = screenProducerRef.current;
+      const producerId = producer?.id;
+      try { producer?.close?.(); } catch (e) {}
+      screenProducerRef.current = null;
+
+      try {
+        localScreenStreamRef.current?.getTracks?.()?.forEach?.((t) => t.stop?.());
+      } catch (e) {}
+      localScreenStreamRef.current = null;
+
+      setActiveScreenShare((prev) => (prev?.isLocal ? null : prev));
+
+      if (producerId && currentCallId.current) {
+        socket.current.emit('close-producer', { callId: currentCallId.current, producerId }, () => {});
+      }
+    } catch (e) {
+      console.error('❌ [RTC] stopScreenShare failed', e?.message || e);
+    }
+  };
+
   /* ================= CALL ACTIONS ================= */
 
   const startCall = async (partnerIdOrIds, callType) => {
@@ -1834,7 +2079,7 @@ export const RTCProvider = ({ children }) => {
               if (Array.isArray(existing) && existing.length) {
                 for (const p of existing) {
                   try {
-                    await consume(p.producerId, p.userId);
+                    await consume(p.producerId, p.userId, p?.source);
                   } catch (e) {
                     console.error('❌ [RTC] consume() failed (existing producer)', {
                       producerId: p?.producerId,
@@ -1862,7 +2107,7 @@ export const RTCProvider = ({ children }) => {
             
             
             
-            navigate('Outgoing Call');
+            replace('Outgoing Call');
             
 
             
@@ -2502,9 +2747,9 @@ export const RTCProvider = ({ children }) => {
               if (Array.isArray(existing) && existing.length) {
                 for (const p of existing) {
                   try {
-                    rtcDbg('processAccept.consuming', { producerId: p?.producerId, userId: p?.userId, kind: p?.kind });
-                    await consume(p.producerId, p.userId);
-                    rtcDbg('processAccept.consumed', { producerId: p?.producerId, userId: p?.userId, kind: p?.kind });
+                    rtcDbg('processAccept.consuming', { producerId: p?.producerId, userId: p?.userId, kind: p?.kind, source: p?.source });
+                    await consume(p.producerId, p.userId, p?.source);
+                    rtcDbg('processAccept.consumed', { producerId: p?.producerId, userId: p?.userId, kind: p?.kind, source: p?.source });
                   } catch (e) {
                     console.error('❌ [RTC] consume() failed (existing producer)', {
                       producerId: p?.producerId,
@@ -2550,7 +2795,7 @@ export const RTCProvider = ({ children }) => {
                   }
                 }
 
-                navigate('Video Call');
+                replace('Video Call');
                 
                 acceptedCallIdRef.current = callIdToUse;
                 acceptSucceededCallIdRef.current = callIdToUse;
@@ -2595,6 +2840,11 @@ export const RTCProvider = ({ children }) => {
   const endCall = async ({ emitToServer = true } = {}) => {
     
     
+    // Stop screen sharing first (best-effort) to avoid leaking ReplayKit capture sessions.
+    try {
+      await stopScreenShare();
+    } catch (e) {}
+
     // CRITICAL: Stop local stream tracks FIRST (before closing producers/transports)
     // This ensures mic/camera indicators disappear on iOS immediately
     if (localStream) {
@@ -2720,11 +2970,19 @@ export const RTCProvider = ({ children }) => {
     setRemoteVideoMuted(false); // Reset remote video mute status
     setCallInfo({ callId: null, type: 'video', participantCount: 0 });
     popToTop();
+    // If stack cannot pop (common after using replace() for call flow), ensure we still exit call UI.
+    try {
+      const cur = navigationRef.getCurrentRoute?.()?.name;
+      if (cur === 'Video Call' || cur === 'Incoming Call' || cur === 'Outgoing Call') {
+        replace('Home');
+      }
+    } catch {}
     setInfo({});
 
     device.current = null;
     currentCallId.current = null;
     remoteStreamRef.current = null;
+    setActiveScreenShare(null);
 
     audioSessionStartedRef.current = false;
     InCallManager.stop();
@@ -2853,6 +3111,11 @@ export const RTCProvider = ({ children }) => {
         participantsMap: participantManager.current, // ParticipantManager instance for lookups
         callInfo, // Call information
         addParticipantsToCall, // Function to add members to call
+        // Screen share (ReplayKit / getDisplayMedia)
+        activeScreenShare,
+        isStartingScreenShare,
+        startScreenShare,
+        stopScreenShare,
       }}
     >
       {children}
