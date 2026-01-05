@@ -3,16 +3,19 @@ import React
 import ReactAppDependencyProvider
 import PushKit
 import WebRTC
+import CallKit
+import AVFoundation
 
 
 @UIApplicationMain
-public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
+public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate, CXProviderDelegate, CXCallObserverDelegate {
   
   
   var window: UIWindow?
 
   // ✅ PKPushRegistry instance for VoIP push notifications
   var voipRegistry: PKPushRegistry?
+  private var callObserver: CXCallObserver?
 
   var reactNativeDelegate: ExpoReactNativeFactoryDelegate?
   var reactNativeFactory: RCTReactNativeFactory?
@@ -37,6 +40,11 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
     
     // ✅ Still call the library's registration method
     RNVoipPushNotificationManager.voipRegistration()
+
+    // Observe CallKit call state changes (works even when RNCallKeep owns the CXProvider delegate).
+    // We use this to re-assert AVAudioSession config on cold-start answers where audio can be silent.
+    callObserver = CXCallObserver()
+    callObserver?.setDelegate(self, queue: DispatchQueue.main)
 
 //    let options = WebRTCModuleOptions.sharedInstance()
 //    options.enableMultitaskingCameraAccess = true
@@ -80,13 +88,36 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
     return super.application(application, continue: userActivity, restorationHandler: restorationHandler) || result
   }
 
-  // //
-  // public func providerDidReset(_ provider: CXProvider) {
-  //   //
-  // }
+  public func providerDidReset(_ provider: CXProvider) {
+    // Required by CXProviderDelegate; RNCallKeep is usually the provider delegate in practice.
+  }
+
+  // Best-practice CallKit answer handling: configure audio session and fulfill.
+  public func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+    print("🟢 [AppDelegate] performAnswerCallAction uuid=\(action.callUUID.uuidString)")
+    configureAudioSessionForCall(defaultToSpeaker: true)
+    action.fulfill()
+  }
+
+  private func configureAudioSessionForCall(defaultToSpeaker: Bool) {
+    do {
+      let session = AVAudioSession.sharedInstance()
+      var options: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
+      if defaultToSpeaker {
+        options.insert(.defaultToSpeaker)
+      }
+      try session.setCategory(.playAndRecord, mode: .voiceChat, options: options)
+      try session.setActive(true, options: [])
+      print("🔊 [AppDelegate] AVAudioSession configured category=\(session.category.rawValue) mode=\(session.mode.rawValue)")
+    } catch {
+      print("❌ [AppDelegate] Failed to configure AVAudioSession: \(error)")
+    }
+  }
 
   // handle updated push credentials
   public func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+    // Re-assert category/mode; CallKit activation order during cold-start can be flaky.
+    configureAudioSessionForCall(defaultToSpeaker: true)
     RTCAudioSession.sharedInstance().audioSessionDidActivate(AVAudioSession.sharedInstance())
   }
 
@@ -104,6 +135,15 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
     
     // ✅ Tell CallKit the action is completed
     action.fulfill()
+  }
+
+  // CXCallObserverDelegate-style callback (implemented on AppDelegate since we set it as delegate).
+  // When a call connects, re-assert AVAudioSession to fix silent-audio on cold-start.
+  public func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+    if call.hasConnected && !call.hasEnded {
+      print("🟢 [AppDelegate] callObserver: call connected uuid=\(call.uuid.uuidString)")
+      configureAudioSessionForCall(defaultToSpeaker: true)
+    }
   }
 
   // ✅ THIS METHOD WILL NOW BE CALLED: handle updated push credentials
@@ -126,9 +166,60 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
   ) {
     print("📱 [AppDelegate] VoIP push received - app state may be backgrounded/killed")
 
-    // process the payload
-    let uuid = payload.dictionaryPayload["uuid"]
-    let hasVideoValue = payload.dictionaryPayload["hasVideo"]
+    // Process payload (support both "incoming" and "end" actions)
+    let dict = payload.dictionaryPayload
+
+    // uuid can arrive as String / NSNumber; normalize to String safely
+    let uuidStr: String? = {
+      if let s = dict["uuid"] as? String { return s }
+      if let n = dict["uuid"] as? NSNumber { return n.stringValue }
+      if let i = dict["uuid"] as? Int { return String(i) }
+      return nil
+    }()
+
+    let action = (dict["action"] as? String)?.lowercased()
+
+    // If server tells us to end/dismiss the CallKit UI (invite timeout), do it and return early.
+    if action == "end" {
+      if let uuid = uuidStr {
+        print("📴 [AppDelegate] VoIP push action=end → ending CallKit call uuid=\(uuid)")
+        DispatchQueue.main.async {
+          // RNCallKeep JS API has:
+          // - endCall(uuid)                   (no reason)
+          // - reportEndCallWithUUID(uuid, reason) (requires reason)
+          //
+          // Swift/ObjC bridging differs a bit across RNCallKeep versions, so invoke dynamically:
+          // Prefer reporting an end reason (UNANSWERED=3) if available, otherwise fall back to endCall.
+          let reason = NSNumber(value: 3) // "unanswered" / timeout
+          let selReport = NSSelectorFromString("reportEndCallWithUUID:reason:")
+          let selEnd = NSSelectorFromString("endCall:")
+
+          if RNCallKeep.responds(to: selReport) {
+            _ = RNCallKeep.perform(selReport, with: uuid, with: reason)
+            print("📴 [AppDelegate] Used RNCallKeep.reportEndCallWithUUID(uuid, reason=3)")
+          } else if RNCallKeep.responds(to: selEnd) {
+            _ = RNCallKeep.perform(selEnd, with: uuid)
+            print("📴 [AppDelegate] Used RNCallKeep.endCall(uuid)")
+          } else {
+            print("⚠️ [AppDelegate] RNCallKeep has no end call selector available")
+          }
+        }
+      } else {
+        print("⚠️ [AppDelegate] VoIP push action=end but missing uuid")
+      }
+
+      // Still forward to RNVoipPushNotificationManager so JS can observe the push if needed.
+      RNVoipPushNotificationManager.didReceiveIncomingPush(
+        with: payload,
+        forType: type.rawValue
+      )
+
+      // Finish PushKit handling.
+      completion()
+      return
+    }
+
+    let hasVideoValue = dict["hasVideo"]
     let hasVideo: Bool = {
       if let boolValue = hasVideoValue as? Bool {
         return boolValue
@@ -141,11 +232,13 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
       }
       return false
     }()
-    let handle = payload.dictionaryPayload["handle"]
-    let caller = payload.dictionaryPayload["callerName"]
+    let handleStr: String = (dict["handle"] as? String) ?? (dict["callerId"] as? String) ?? "Unknown"
+    let callerStr: String = (dict["callerName"] as? String) ?? handleStr
 
 
-    RNVoipPushNotificationManager.addCompletionHandler(uuid as! String, completionHandler: completion)
+    if let uuid = uuidStr {
+      RNVoipPushNotificationManager.addCompletionHandler(uuid, completionHandler: completion)
+    }
 
     RNVoipPushNotificationManager.didReceiveIncomingPush(
         with: payload,
@@ -154,12 +247,13 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
 
     // display the incoming call notification
     // ✅ This will show the CallKit UI even when app is killed
+    if let uuid = uuidStr {
     RNCallKeep.reportNewIncomingCall(
-      uuid as! String,
-      handle: handle as! String,
+        uuid,
+        handle: handleStr,
         handleType: "generic",
         hasVideo: hasVideo,
-      localizedCallerName: caller as! String,
+        localizedCallerName: callerStr,
         supportsHolding: true,
         supportsDTMF: true,
         supportsGrouping: true,
@@ -168,6 +262,10 @@ public class AppDelegate: ExpoAppDelegate, PKPushRegistryDelegate {
         payload: nil,
         withCompletionHandler: completion
     )
+    } else {
+      print("⚠️ [AppDelegate] VoIP push missing uuid; cannot report incoming call")
+      completion()
+    }
   }
   
   // ✅ ADD THIS: Handle push registry invalid token (optional but recommended)

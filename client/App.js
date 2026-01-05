@@ -29,6 +29,7 @@ import { RTCProvider } from './context/rtc';
 import { BottomSheetModalProvider } from '@gorhom/bottom-sheet';
 
 import { ToastProvider } from './context/ToastContext';
+import CallPIPHost from './components/CallPIPHost';
 
 
 //Use any key of choice 
@@ -96,6 +97,7 @@ export default function App(){
                       <PaperProvider>
                           <ToastProvider>
                             <BottomSheetModalProvider>
+                                  <CallPIPHost />
                                   <NavigationWrapper />
                             </BottomSheetModalProvider>
                           </ToastProvider>

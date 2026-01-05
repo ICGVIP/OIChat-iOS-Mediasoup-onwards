@@ -1,5 +1,3 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { EventTarget } from 'event-target-shim';
 import { AppRegistry, Platform } from 'react-native';
 import RNCallKeep from 'react-native-callkeep';
 import 'react-native-gesture-handler';
@@ -7,14 +5,9 @@ import VoipPushNotification from "react-native-voip-push-notification";
 import { registerGlobals } from 'react-native-webrtc';
 import App from './App';
 
-const options = {
-    ios:{
-        appName:'OIChat'
-    }
-}
 
 registerGlobals();
-
+global.__RTC_DEBUG__ = true;
 
 VoipPushNotification.addEventListener('notification', async (voipPayload)=>{
 
@@ -34,6 +27,9 @@ VoipPushNotification.addEventListener('notification', async (voipPayload)=>{
         ...voipPayload // Include any other data from the payload
     };
     
+    // Persist so RTC layer can recover call context after cold-start.
+    // (This is separate from VoIP token registration.)
+    const AsyncStorage = require('@react-native-async-storage/async-storage').default;
     await AsyncStorage.setItem('incomingCallData', JSON.stringify(callData));
     console.log('💾 Saved VoIP call data to AsyncStorage');
 

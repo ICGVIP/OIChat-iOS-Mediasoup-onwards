@@ -5,6 +5,7 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import {useSelector, useDispatch} from 'react-redux';
 import {StyleSheet, useColorScheme, Alert, Platform, AppState, Text} from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import VoipPushNotification from "react-native-voip-push-notification";
 
 // All Screens needed
 import Opening from './Opening'
@@ -58,7 +59,7 @@ import SelfChatInfo from './Chats/sub-screens/SelfChatInfo';
 
 import ViewBlockedUsers from './Profile/sub-screens/ViewBlockedUsers';
 import Screen3 from './Screen3';
-import { flushNavQueue, navigate, navigationRef } from '../utils/staticNavigationutils';
+import { flushNavQueue, navigate, replace, navigationRef } from '../utils/staticNavigationutils';
 
 const Stack = createNativeStackNavigator();
 
@@ -82,7 +83,10 @@ const AuthContainer = () => {
 
   let {socket, setChats,ask, setHiddenChats, setArchivedChats} = useChannelSet();
   let user = useSelector(state=>state.user.value);
-  let {setType, type, processAccept, endCall, waitForIncomingCallSetup, socket: rtcSocket} = useRTC()
+  let {setType, type, processAccept, endCall, waitForIncomingCallSetup, socket: rtcSocket, shouldEmitLeaveToServer} = useRTC()
+  const callkeepAnswerHandledRef = useRef(false);
+  const callkeepPendingEndTimerRef = useRef(null);
+  const callkeepLastAnswerAtRef = useRef(0);
 
   useEffect(()=>{
     (
@@ -102,7 +106,6 @@ const AuthContainer = () => {
             setArchivedChats(response.archived)
           }
           
-          console.log('Chattein fir fetch karwayi maine toh...\n\n', response.data)
         }catch(err){
           console.log(err,'Error in fetching chats....\n\n')
         }
@@ -116,38 +119,106 @@ const AuthContainer = () => {
   useEffect(() => {
     const onAnswer = async () => {
       try {
-      const callDataStr = await AsyncStorage.getItem('incomingCallData');
-        if (!callDataStr) return endCall();
-      
-        // Wait for socket
-        let tries = 0;
-        while (!rtcSocket?.connected && tries < 30) {
-          await new Promise(r => setTimeout(r, 100));
-          tries++;
-        }
-
-        await waitForIncomingCallSetup();
-        await processAccept();
-        
-          navigate('Video Call');
+      console.log('[CALLKEEP][NAV] answerCall event fired', {
+        hasUserToken: !!user?.token,
+        hasUserData: !!user?.data,
+        rtcSocketConnected: rtcSocket?.connected,
+        navReady: navigationRef?.isReady?.() ? true : false,
+        time: Date.now(),
+      });
+      if (callkeepAnswerHandledRef.current) {
+        console.log('[NAV] Ignoring duplicate CallKeep answerCall event');
+        return;
+      }
+      callkeepAnswerHandledRef.current = true;
+      callkeepLastAnswerAtRef.current = Date.now();
+      if (callkeepPendingEndTimerRef.current) {
+        try { clearTimeout(callkeepPendingEndTimerRef.current); } catch {}
+        callkeepPendingEndTimerRef.current = null;
+      }
+      // Cold-start reality:
+      // - "answerCall" can fire before we have incomingCallData (VoIP JS event) OR before server resends 'incoming-call'
+      // - socket ref exported from RTC context may be stale at this layer
+      // So we just wait for RTC layer to report it's ready to accept (socket connected + callId known).
+      console.log('[CALLKEEP][NAV] waiting for incoming call setup (callId + socket)...');
+      await waitForIncomingCallSetup();
+      console.log('[CALLKEEP][NAV] incoming call setup ready, calling processAccept()...');
+      await processAccept({ source: 'callkeep' });
+      // processAccept() already transitions to Video Call via navigation helper.
+      // Avoid double navigation which can cause a brief "flash" / second navigation.
+      console.log('[CALLKEEP][NAV] processAccept() finished');
       } catch (err) {
         console.error('[NAV] Accept failed:', err);
         endCall();
+      } finally {
+        // Allow future calls to be answered
+        setTimeout(() => {
+          callkeepAnswerHandledRef.current = false;
+        }, 2000);
       }
     };
 
     const onEnd = async () => {
-          await endCall();
-          navigate('Home');
+          const now = Date.now();
+          console.log('[CALLKEEP][NAV] endCall event fired', { time: now });
+
+          // CallKit can emit endCall during cold-start/rehydration even when user intends to answer.
+          // Debounce: if answerCall fires shortly after, ignore this endCall.
+          if (callkeepPendingEndTimerRef.current) {
+            try { clearTimeout(callkeepPendingEndTimerRef.current); } catch {}
+            callkeepPendingEndTimerRef.current = null;
+          }
+
+          callkeepPendingEndTimerRef.current = setTimeout(async () => {
+            try {
+              const msSinceAnswer = now - (callkeepLastAnswerAtRef.current || 0);
+              // If answer happened recently, treat this endCall as spurious.
+              if (callkeepLastAnswerAtRef.current && msSinceAnswer >= 0 && msSinceAnswer < 1500) {
+                console.log('[CALLKEEP][NAV] ignoring endCall (answerCall won the race)', { msSinceAnswer });
+                return;
+              }
+
+              const emitToServer = typeof shouldEmitLeaveToServer === 'function' ? shouldEmitLeaveToServer() : false;
+              console.log('[CALLKEEP][NAV] ending call from CallKeep endCall', { emitToServer });
+              await endCall({ emitToServer });
+              navigate('Home');
+            } catch (e) {
+              console.warn('[CALLKEEP][NAV] endCall handler failed:', e?.message || e);
+            }
+          }, 600);
+    };
+
+    // If the app was launched by CallKit, events can arrive before JS subscribed.
+    // RNCallKeep replays them via didLoadWithEvents.
+    const onDidLoadWithEvents = (events) => {
+      try {
+        console.log('[CALLKEEP][NAV] didLoadWithEvents', {
+          count: Array.isArray(events) ? events.length : 0,
+          events,
+          time: Date.now(),
+        });
+        (events || []).forEach((e) => {
+          if (e?.name === 'answerCall') onAnswer();
+          if (e?.name === 'endCall') onEnd();
+        });
+      } catch (err) {
+        console.warn('[NAV] didLoadWithEvents handler error:', err);
+      }
     };
 
     RNCallKeep.addEventListener('answerCall', onAnswer);
     RNCallKeep.addEventListener('endCall', onEnd);
+    RNCallKeep.addEventListener('didLoadWithEvents', onDidLoadWithEvents);
 
     return () => {
       try {
         RNCallKeep.removeEventListener('answerCall', onAnswer);
         RNCallKeep.removeEventListener('endCall', onEnd);
+        RNCallKeep.removeEventListener('didLoadWithEvents', onDidLoadWithEvents);
+        if (callkeepPendingEndTimerRef.current) {
+          try { clearTimeout(callkeepPendingEndTimerRef.current); } catch {}
+          callkeepPendingEndTimerRef.current = null;
+        }
       } catch (error) {
         console.warn('[NAV] Error removing CallKeep listeners during cleanup:', error);
         // Silently handle errors during cleanup to prevent crashes on logout
@@ -222,14 +293,17 @@ const AuthContainer = () => {
               <Stack.Screen 
               name='Video Call'
               component={VideoCall}
+              options={{ gestureEnabled: false }}
               />
               <Stack.Screen 
                 name='Outgoing Call'
                 component = {OutgoingCall}
+                options={{ gestureEnabled: false }}
               />
               <Stack.Screen 
                 name='Incoming Call'
                 component={IncomingCall}
+                options={{ gestureEnabled: false }}
               />
               <Stack.Screen
               name='Demo'
@@ -325,6 +399,7 @@ const NavigationWrapper = () => {
     let [appState, setAppState] = useState(AppState.currentState)
     let {contacts} = useSelector(state=>state.contacts.value);
     const prevUserDataRef = useRef(user?.data);
+    const voipTokenSyncInFlightRef = useRef(false);
     
     let dispatch = useDispatch();
     
@@ -394,6 +469,60 @@ const NavigationWrapper = () => {
       )();
 
     },[]);
+
+    // ---- VoIP push token register + sync (iOS, after login) ----
+    // Per your preference: once we know the user is logged in, we request the PushKit token and
+    // upload it immediately (no early AsyncStorage caching in index.js).
+    useEffect(() => {
+      if (Platform.OS !== 'ios') return;
+      if (!user?.token) return;
+
+      let cancelled = false;
+
+      const syncTokenToBackend = async (token) => {
+        try {
+          if (!token || cancelled) return;
+          if (voipTokenSyncInFlightRef.current) return;
+          voipTokenSyncInFlightRef.current = true;
+
+          const reply = await fetch('http://216.126.78.3:8500/api/register-voip-token', {
+            method: 'POST',
+            headers: {
+              'Content-type': 'application/json',
+              'Authorization': `Bearer ${user.token}`,
+            },
+            body: JSON.stringify({ voipToken: token }),
+          });
+
+          let resJson = null;
+          try { resJson = await reply.json(); } catch {}
+          console.log('📱 [VoIP] register-voip-token result:', { ok: reply.ok, status: reply.status, res: resJson });
+        } catch (e) {
+          console.warn('⚠️ [VoIP] Failed to sync voip token:', e?.message || e);
+        } finally {
+          voipTokenSyncInFlightRef.current = false;
+        }
+      };
+
+      const onRegister = (token) => {
+        console.log('📱 [VoIP] pushkit token received:', token);
+        syncTokenToBackend(token);
+      };
+
+      try {
+        VoipPushNotification.addEventListener('register', onRegister);
+      } catch {}
+
+      // Trigger registration now that we have a logged-in user (most reliable point to sync).
+      try {
+        VoipPushNotification.registerVoipToken();
+      } catch {}
+
+      return () => {
+        cancelled = true;
+        try { VoipPushNotification.removeEventListener('register', onRegister); } catch {}
+      };
+    }, [user?.token]);
 
 
     async function setcontacts_tom(){
