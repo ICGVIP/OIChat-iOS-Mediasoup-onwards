@@ -17,6 +17,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import RNCallKeep from 'react-native-callkeep';
 import { navigate } from '../../../utils/staticNavigationutils';
+// import { startGlobalIOSPIP } from '../../../utils/pipHost'; // Manual PiP disabled; rely on iosPIP.startAutomatically
 import { MenuView } from '@react-native-menu/menu';
 import EmojiPicker from "rn-emoji-keyboard";
 import {
@@ -30,7 +31,7 @@ const barWidth = windowWidth*0.85;
 const topMargin = windowHeight*0.08;
 
 /* ================= PARTICIPANT VIEW COMPONENT ================= */
-const ParticipantView = ({ participant, style, localMicStatus, localVideoStatus, reactionEmoji, callType }) => {
+const ParticipantView = ({ participant, style, localMicStatus, localVideoStatus, reactionEmoji, callType, showPin, isPinned, onTogglePin }) => {
     const { userId, name, firstName, lastName, username, avatar, stream, muted, isLocal, streamKey } = participant;
     
     // Use participant.muted for all users (including local) - it's updated by toggle functions
@@ -54,6 +55,26 @@ const ParticipantView = ({ participant, style, localMicStatus, localVideoStatus,
 
     return (
         <View style={[styles.participantContainer, style]}>
+            {/* Pin icon (tile UIs only: group calls / 1:1 screenshare viewer) */}
+            {!!showPin && !participant?.isScreenShare && (
+                <TouchableOpacity
+                    onPress={() => onTogglePin?.(userId)}
+                    activeOpacity={0.8}
+                    style={{
+                        position: 'absolute',
+                        right: 10,
+                        top: 10,
+                        zIndex: 260,
+                        elevation: 260,
+                        backgroundColor: 'rgba(0,0,0,0.35)',
+                        paddingHorizontal: 8,
+                        paddingVertical: 6,
+                        borderRadius: 14,
+                    }}
+                >
+                    <MaterialIcons name="push-pin" size={18} color={isPinned ? '#ff8a00' : 'white'} />
+                </TouchableOpacity>
+            )}
                 {/* Reaction (top-center, 30s TTL) */}
                 {!!reactionEmoji && (
                     <View style={{
@@ -130,7 +151,7 @@ const ParticipantView = ({ participant, style, localMicStatus, localVideoStatus,
 };
 
 /* ================= GROUP CALL VIEW COMPONENT ================= */
-const GroupCallView = ({ participants, localStream, localMicStatus, localVideoStatus, reactionsByUser, callType }) => {
+const GroupCallView = ({ participants, localStream, localMicStatus, localVideoStatus, reactionsByUser, callType, listHeaderComponent, pinnedUserId, onTogglePin, showPins, extraItems }) => {
     // Debug log to see what participants we're receiving
     useEffect(() => {
         console.log('📊 [GroupCallView] Received participants:', {
@@ -139,12 +160,15 @@ const GroupCallView = ({ participants, localStream, localMicStatus, localVideoSt
         });
     }, [participants]);
     
-    // Ensure local participant is first
+    // Ensure local participant is first, and optionally inject extraItems (e.g. screenshare tile) into the grid.
     const sortedParticipants = useMemo(() => {
-        const local = participants.find(p => p.isLocal);
-        const remote = participants.filter(p => !p.isLocal);
-        return local ? [local, ...remote] : participants;
-    }, [participants]);
+        const list = Array.isArray(participants) ? participants : [];
+        const local = list.find(p => p.isLocal);
+        const remote = list.filter(p => !p.isLocal);
+        const base = local ? [local, ...remote] : list;
+        const extras = Array.isArray(extraItems) ? extraItems : [];
+        return extras.length ? [...extras, ...base] : base;
+    }, [participants, extraItems]);
 
     const gridPadding = 12;
     const gridGap = 10;
@@ -158,6 +182,7 @@ const GroupCallView = ({ participants, localStream, localMicStatus, localVideoSt
             numColumns={2}
             showsVerticalScrollIndicator={false}
             style={{ flex: 1 }}
+            ListHeaderComponent={listHeaderComponent || null}
             contentContainerStyle={{
                 padding: gridPadding,
                 paddingTop: gridPadding + 16,
@@ -172,6 +197,9 @@ const GroupCallView = ({ participants, localStream, localMicStatus, localVideoSt
                     localVideoStatus={localVideoStatus}
                     callType={callType}
                     reactionEmoji={reactionsByUser?.[item?.userId?.toString?.() ?? String(item?.userId)]?.emoji || null}
+                    showPin={!!showPins}
+                    isPinned={(item?.userId?.toString?.() ?? String(item?.userId)) === (pinnedUserId?.toString?.() ?? String(pinnedUserId))}
+                    onTogglePin={onTogglePin}
                     style={{
                         width: tileWidth,
                         height: tileHeight,
@@ -207,6 +235,7 @@ const VideoCall = ({navigation}) => {
         isStartingScreenShare,
         startScreenShare,
         stopScreenShare,
+        waitForBroadcastStarted,
     } = useRTC();
 
     // If call state is already torn down (e.g., remote hung up and endCall() is popping the stack),
@@ -222,6 +251,7 @@ const VideoCall = ({navigation}) => {
     const [firstName, setFirstName] = useState('');
     const [lastName, setLastName] = useState('');
     const [streamsSwapped, setStreamsSwapped] = useState(false); // Track if streams are swapped
+    const [pinnedTileUserId, setPinnedTileUserId] = useState(null); // UI-only pin (group + 1:1 screenshare viewer)
     const contacts = useSelector((state) => state.contacts.value.contacts);
     const user = useSelector((state) => state.user.value);
     const insets = useSafeAreaInsets();
@@ -328,6 +358,14 @@ const VideoCall = ({navigation}) => {
             setLastName(matchedContact.item.lastName || '');
         }
     }, [info?.id, info?.name, info?.type, contacts]);
+
+    // Pinning is only supported in tile UIs.
+    // If we return to normal 1:1 UI (no screenshare and not group), clear the pin.
+    useEffect(() => {
+        if (!isGroupUI && !activeScreenShare?.stream) {
+            setPinnedTileUserId(null);
+        }
+    }, [isGroupUI, activeScreenShare?.stream]);
 
     useEffect(() => {
         // Track status changes
@@ -660,12 +698,10 @@ const VideoCall = ({navigation}) => {
         // Render state tracking
     }, [remoteStream, info?.type]);
 
-
-
     const handleMinimize = () => {
-        console.log('📱 Minimize button pressed - PiP mode');
-        // Avoid calling startIOSPIP/stopIOSPIP (can crash on some RN bridgeless/UIManager queue paths).
-        // We rely on iosPIP.startAutomatically when the app backgrounds.
+        if (Platform.OS !== 'ios') return;
+        // Manual PiP start disabled; rely on `iosPIP.startAutomatically` when app backgrounds.
+        // (Minimize button can remain as a UI affordance, but should not call into UIManager.)
         Alert.alert('Picture in Picture', 'Swipe up to go Home to start PiP.');
     };
 
@@ -701,9 +737,13 @@ const VideoCall = ({navigation}) => {
 
     const handleShareScreen = async () => {
         try {
-            // Must be user-initiated: trigger ReplayKit Broadcast Picker.
-            _showReplayKitPicker();
             bottomSheetModalRef.current?.dismiss();
+            if (Platform.OS === 'ios') {
+                // iOS: must start the ReplayKit broadcast extension first.
+                // Wait until extension confirms it started, then call getDisplayMedia/produce.
+                _showReplayKitPicker();
+                await waitForBroadcastStarted?.({ timeoutMs: 10000 });
+            }
             await startScreenShare();
         } catch (e) {
             console.error('❌ [VideoCall] handleShareScreen failed', e?.message || e);
@@ -770,6 +810,7 @@ const VideoCall = ({navigation}) => {
                 <ScreenCapturePickerView ref={screenPickerRef} />
             </View>
 
+
             {/*Upper Actions - Hangup and Minimize */}
             <View style={styles.pillTop}>
                 <TouchableOpacity onPress={handleMinimize}>
@@ -790,95 +831,130 @@ const VideoCall = ({navigation}) => {
                 </TouchableOpacity>
             </View>
 
-            {/* Screen Share (Pinned / Presentation Tile) - show to viewers only (not the presenter).
-                1:1 layout handles screen share separately to avoid being covered by absoluteFill RTCViews. */}
-            {isGroupUI && !activeScreenShare?.isLocal && !!activeScreenShare?.stream && typeof activeScreenShare.stream?.toURL === 'function' && (
-                <View style={{
-                    width: windowWidth,
-                    alignSelf: 'center',
-                    marginTop: 6,
-                    marginBottom: 8,
-                    borderRadius: 14,
-                    overflow: 'hidden',
-                    backgroundColor: 'rgba(0,0,0,0.85)',
-                }}>
-                    <RTCView
-                        key={`screenshare-${activeScreenShare?.isLocal ? 'local' : 'remote'}-${activeScreenShare?.userId}-${activeScreenShare?.stream?.id || 's'}`}
-                        streamURL={activeScreenShare.stream.toURL()}
-                        objectFit="contain"
-                        style={{
-                            width: windowWidth,
-                            height: Math.min(
-                                windowHeight * 0.62,
-                                windowWidth / (activeScreenShare?.aspectRatio || (16 / 9))
-                            ),
-                            backgroundColor: 'black',
-                        }}
-                        zOrder={20}
-                        mirror={false}
-                    />
-                    <View style={{
-                        position: 'absolute',
-                        left: 10,
-                        top: 10,
-                        backgroundColor: 'rgba(0,0,0,0.35)',
-                        paddingHorizontal: 10,
-                        paddingVertical: 6,
-                        borderRadius: 14,
-                    }}>
-                        <Text style={{ color: 'white', fontWeight: '600' }}>Screen share</Text>
-                    </View>
-                </View>
-            )}
+            {/* Screen Share (Pinned / Presentation Tile) is now rendered as the GROUP FlatList header,
+                so scrolling works even when the tile is large. */}
 
             {/*Upper Actions - Video/Audio Content*/}
             {isGroupUI ? (
-                <GroupCallView 
-                    participants={participantsList} 
-                    localStream={localStream}
-                    localMicStatus={micStatus}
-                    localVideoStatus={videoStatus}
-                    reactionsByUser={reactionsByUser}
-                    callType={info?.type}
-                />
-            ) : (
-                <>
-                    {/* 1:1 Screen Share Layout (viewer only, not the presenter) */}
-                    {(!isGroupUI && !activeScreenShare?.isLocal && !!activeScreenShare?.stream && typeof activeScreenShare.stream?.toURL === 'function') ? (
-                        (() => {
-                            const gridPadding = 12;
-                            const gridGap = 10;
-                            const tileWidth = (windowWidth - (gridPadding * 2) - gridGap) / 2;
-                            const tileHeight = tileWidth * 1.35;
+                (() => {
+                    const list = Array.isArray(participantsList) ? participantsList : [];
 
-                            const remoteDisplayName = (() => {
-                                const full = `${firstName || ''} ${lastName || ''}`.trim();
-                                return (full || name || 'Unknown').trim() || 'Unknown';
-                            })();
+                    const firstToken = (s) => {
+                        const v = (s ?? '').toString().trim();
+                        if (!v) return '';
+                        return v.split(/\s+/)[0] || v;
+                    };
 
-                            const titleBase = remoteDisplayName;
-                            const title = (titleBase.endsWith('s') ? `${titleBase}' Screen` : `${titleBase}'s Screen`);
+                    const normalizeId = (x) => x?.toString?.() ?? String(x ?? '');
 
-                            const aspect = activeScreenShare?.aspectRatio || (16 / 9);
-                            const shareHeight = Math.min(windowHeight * 0.62, windowWidth / aspect);
+                    const togglePin = (uid) => {
+                        const id = normalizeId(uid);
+                        if (!id) return;
+                        setPinnedTileUserId((prev) => (normalizeId(prev) === id ? null : id));
+                    };
 
-                            const hasRemoteVideoTrack = !!remoteStream && (remoteStream.getVideoTracks?.()?.length || 0) > 0;
-                            const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
+                    const pinnedId = pinnedTileUserId ? normalizeId(pinnedTileUserId) : null;
+                    const pinnedParticipant = pinnedId
+                        ? list.find((p) => normalizeId(p?.userId) === pinnedId)
+                        : null;
 
+                    // Build screenshare label + item (used as large header when NOT pinned; used as grid tile when pinned).
+                    const canShowRemoteScreenShare =
+                        !activeScreenShare?.isLocal &&
+                        !!activeScreenShare?.stream &&
+                        typeof activeScreenShare.stream?.toURL === 'function';
+
+                    const screenPresenterFirstName = (() => {
+                        if (!canShowRemoteScreenShare) return '';
+                        const uidStr = normalizeId(activeScreenShare?.userId);
+                        try {
+                            if (uidStr && Array.isArray(contacts)) {
+                                for (let i of contacts) {
+                                    if (i?.isRegistered && normalizeId(i?.server_info?.id) === uidStr) {
+                                        const fn = i?.item?.firstName || '';
+                                        const n = i?.item?.name || `${i?.item?.firstName || ''} ${i?.item?.lastName || ''}`.trim();
+                                        return firstToken(fn || n);
+                                    }
+                                }
+                            }
+                        } catch {}
+                        try {
+                            const p = list.find((x) => normalizeId(x?.userId) === uidStr);
+                            const best =
+                                (p?.name && p.name !== 'Unknown' && p.name !== uidStr) ? p.name :
+                                ((p?.firstName || p?.lastName) ? `${p.firstName || ''} ${p.lastName || ''}`.trim() :
+                                    (p?.username ? String(p.username) : ''));
+                            return firstToken(best);
+                        } catch {}
+                        return '';
+                    })();
+
+                    const screenLabelBase = screenPresenterFirstName || 'Screen';
+                    const screenLabel = screenLabelBase.endsWith('s') ? `${screenLabelBase}' Screen` : `${screenLabelBase}'s Screen`;
+
+                    const screenShareGridItem = (canShowRemoteScreenShare && pinnedId)
+                        ? {
+                            userId: `__screenshare__${normalizeId(activeScreenShare?.userId)}`,
+                            isLocal: false,
+                            isScreenShare: true,
+                            name: screenLabel,
+                            stream: activeScreenShare.stream,
+                            muted: { mic: true, video: false },
+                            streamKey: activeScreenShare?.stream?.id || 's',
+                          }
+                        : null;
+
+                    const participantsWithoutPinned = pinnedId
+                        ? list.filter((p) => normalizeId(p?.userId) !== pinnedId)
+                        : list;
+
+                    // Pinned header sizing: keep it the same size as the screenshare header.
+                    const pinnedHeight = windowHeight * 0.7;
+
+                    const listHeader = (() => {
+                        // If pinned: pinned tile goes first; do NOT show screenshare big header.
+                        if (pinnedParticipant) {
                             return (
-                                <View style={{ flex: 1 }}>
-                                    {/* Presentation tile */}
+                                <View style={{ paddingTop: 6 }}>
                                     <View style={{
                                         width: windowWidth,
                                         alignSelf: 'center',
-                                        marginTop: 6,
                                         marginBottom: 12,
                                         borderRadius: 14,
                                         overflow: 'hidden',
                                         backgroundColor: 'rgba(0,0,0,0.85)',
                                     }}>
-                                <RTCView
-                                            key={`screenshare-1to1-${activeScreenShare?.isLocal ? 'local' : 'remote'}-${activeScreenShare?.userId}-${activeScreenShare?.stream?.id || 's'}`}
+                                        <ParticipantView
+                                            participant={pinnedParticipant}
+                                            localMicStatus={micStatus}
+                                            localVideoStatus={videoStatus}
+                                            reactionsByUser={reactionsByUser}
+                                            callType={info?.type}
+                                            showPin={true}
+                                            isPinned={true}
+                                            onTogglePin={togglePin}
+                                            style={{ width: windowWidth, height: pinnedHeight }}
+                                        />
+                                    </View>
+                                </View>
+                            );
+                        }
+
+                        // No pin: screenshare (viewer only) stays as the big header (same as current behavior).
+                        if (canShowRemoteScreenShare) {
+                            const shareHeight = windowHeight * 0.7;
+                            return (
+                                <View style={{ paddingTop: 6 }}>
+                                    <View style={{
+                                        width: windowWidth,
+                                        alignSelf: 'center',
+                                        marginBottom: 12,
+                                        borderRadius: 14,
+                                        overflow: 'hidden',
+                                        backgroundColor: 'rgba(0,0,0,0.85)',
+                                    }}>
+                                        <RTCView
+                                            key={`screenshare-${activeScreenShare?.userId}-${activeScreenShare?.stream?.id || 's'}`}
                                             streamURL={activeScreenShare.stream.toURL()}
                                             objectFit="contain"
                                             style={{
@@ -898,60 +974,271 @@ const VideoCall = ({navigation}) => {
                                             paddingVertical: 6,
                                             borderRadius: 14,
                                         }}>
-                                            <Text style={{ color: 'white', fontWeight: '700' }}>{title}</Text>
+                                            <Text style={{ color: 'white', fontWeight: '600' }}>{screenLabel}</Text>
                                         </View>
-                                        {/* Viewer-only tile; presenter sees a small status pill near controls instead */}
                                     </View>
+                                </View>
+                            );
+                        }
 
-                                    {/* Below: remote camera tile (group-like size) */}
-                                    <View style={{ paddingHorizontal: gridPadding }}>
+                        return null;
+                    })();
+
+                    return (
+                        <GroupCallView
+                            participants={participantsWithoutPinned}
+                            localStream={localStream}
+                            localMicStatus={micStatus}
+                            localVideoStatus={videoStatus}
+                            reactionsByUser={reactionsByUser}
+                            callType={info?.type}
+                            listHeaderComponent={listHeader}
+                            pinnedUserId={pinnedId}
+                            onTogglePin={togglePin}
+                            showPins={true}
+                            extraItems={screenShareGridItem ? [screenShareGridItem] : null}
+                        />
+                    );
+                })()
+            ) : (
+                <>
+                    {/* 1:1 Screen Share Layout (viewer only, not the presenter) */}
+                    {(!isGroupUI && !activeScreenShare?.isLocal && !!activeScreenShare?.stream && typeof activeScreenShare.stream?.toURL === 'function') ? (
+                        (() => {
+                            const gridPadding = 12;
+                            const gridGap = 10;
+                            const tileWidth = (windowWidth - (gridPadding * 2) - gridGap) / 2;
+                            const tileHeight = tileWidth * 1.35;
+
+                            const remoteDisplayName = (() => {
+                                const full = `${firstName || ''} ${lastName || ''}`.trim();
+                                return (full || name || 'Unknown').trim() || 'Unknown';
+                            })();
+
+                            const titleBase = remoteDisplayName;
+                            const firstToken = (s) => {
+                                const v = (s ?? '').toString().trim();
+                                if (!v) return '';
+                                return v.split(/\s+/)[0] || v;
+                            };
+                            const titleBaseFirst = firstToken(firstName || remoteDisplayName);
+                            const title = ((titleBaseFirst || 'Screen').endsWith('s')
+                                ? `${titleBaseFirst || 'Screen'}' Screen`
+                                : `${titleBaseFirst || 'Screen'}'s Screen`);
+
+                            const shareHeight = windowHeight * 0.7;
+
+                            const hasRemoteVideoTrack = !!remoteStream && (remoteStream.getVideoTracks?.()?.length || 0) > 0;
+                            const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
+
+                            const normalizeId = (x) => x?.toString?.() ?? String(x ?? '');
+                            const remoteIdStr = normalizeId(info?.id);
+                            const isPinnedRemote = !!pinnedTileUserId && normalizeId(pinnedTileUserId) === remoteIdStr;
+
+                            const pinnedHeight = windowHeight * 0.7;
+
+                            return (
+                                <ScrollView
+                                    style={{ flex: 1 }}
+                                    contentContainerStyle={{ paddingBottom: 220 }}
+                                    showsVerticalScrollIndicator={false}
+                                >
+                                    {/* Header tile:
+                                        - default: screenshare is big (current behavior)
+                                        - if pinned: remote tile becomes big, and screenshare becomes a normal small tile below */}
+                                    {!isPinnedRemote ? (
                                         <View style={{
-                                            width: tileWidth,
-                                            height: tileHeight,
-                                            borderRadius: 16,
+                                            width: windowWidth,
+                                            alignSelf: 'center',
+                                            marginTop: 6,
+                                            marginBottom: 12,
+                                            borderRadius: 14,
                                             overflow: 'hidden',
-                                            backgroundColor: 'rgb(25,25,25)',
+                                            backgroundColor: 'rgba(0,0,0,0.85)',
+                                        }}>
+                                            <RTCView
+                                                key={`screenshare-1to1-${activeScreenShare?.isLocal ? 'local' : 'remote'}-${activeScreenShare?.userId}-${activeScreenShare?.stream?.id || 's'}`}
+                                                streamURL={activeScreenShare.stream.toURL()}
+                                                objectFit="contain"
+                                                style={{
+                                                    width: windowWidth,
+                                                    height: shareHeight,
+                                                    backgroundColor: 'black',
+                                                }}
+                                                zOrder={20}
+                                                mirror={false}
+                                            />
+                                            <View style={{
+                                                position: 'absolute',
+                                                left: 10,
+                                                top: 10,
+                                                backgroundColor: 'rgba(0,0,0,0.35)',
+                                                paddingHorizontal: 10,
+                                                paddingVertical: 6,
+                                                borderRadius: 14,
+                                            }}>
+                                                <Text style={{ color: 'white', fontWeight: '700' }}>{title}</Text>
+                                            </View>
+                                            {/* Viewer-only tile; presenter sees a small status pill near controls instead */}
+                                        </View>
+                                    ) : (
+                                        <View style={{
+                                            width: windowWidth,
+                                            alignSelf: 'center',
+                                            marginTop: 6,
+                                            marginBottom: 12,
+                                            borderRadius: 14,
+                                            overflow: 'hidden',
+                                            backgroundColor: 'rgba(0,0,0,0.85)',
                                         }}>
                                             {canRenderRemote ? (
                                                 <RTCView
-                                                    key={`remote-tile-${remoteStream.id}-${remoteStreamTracksCount}`}
+                                                    key={`remote-pinned-${remoteStream.id}-${remoteStreamTracksCount}`}
                                                     streamURL={remoteStream.toURL()}
-                                    objectFit="cover"
-                                    style={StyleSheet.absoluteFill}
-                                    zOrder={0}
-                                    mirror={false}
-                                />
+                                                    objectFit="contain"
+                                                    style={{ width: windowWidth, height: pinnedHeight, backgroundColor: 'black' }}
+                                                    zOrder={0}
+                                                    mirror={false}
+                                                />
                                             ) : (
-                                                <View style={[StyleSheet.absoluteFill, { justifyContent: 'center', alignItems: 'center' }]}>
+                                                <View style={[{ width: windowWidth, height: pinnedHeight, backgroundColor: 'black', justifyContent: 'center', alignItems: 'center' }]}>
                                                     <Avatar.Text
-                                                        size={56}
+                                                        size={72}
                                                         label={(remoteDisplayName || 'U').slice(0, 1).toUpperCase()}
                                                         style={{ backgroundColor: 'rgb(60,60,60)' }}
                                                     />
-                                                    <Text style={{ color: 'white', marginTop: 8, fontWeight: '700' }} numberOfLines={1}>
+                                                    <Text style={{ color: 'white', marginTop: 10, fontWeight: '800', fontSize: 16 }} numberOfLines={1}>
                                                         {remoteDisplayName}
                                                     </Text>
-                                                    <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 4 }}>
+                                                    <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 6, fontWeight: '700' }}>
                                                         {remoteVideoMuted ? 'Video is off' : 'Connecting…'}
                                                     </Text>
                                                 </View>
                                             )}
-                                            <View style={{
-                                                position: 'absolute',
-                                                left: 8,
-                                                bottom: 8,
-                                                backgroundColor: 'rgba(0,0,0,0.35)',
-                                                paddingHorizontal: 8,
-                                                paddingVertical: 4,
-                                                borderRadius: 12,
-                                            }}>
-                                                <Text style={{ color: 'white', fontWeight: '700' }} numberOfLines={1}>
-                                                    {remoteDisplayName}
-                                                </Text>
-                                            </View>
+                                            <TouchableOpacity
+                                                onPress={() => setPinnedTileUserId(null)}
+                                                activeOpacity={0.8}
+                                                style={{
+                                                    position: 'absolute',
+                                                    right: 10,
+                                                    top: 10,
+                                                    zIndex: 50,
+                                                    elevation: 50,
+                                                    backgroundColor: 'rgba(0,0,0,0.35)',
+                                                    paddingHorizontal: 8,
+                                                    paddingVertical: 6,
+                                                    borderRadius: 14,
+                                                }}
+                                            >
+                                                <MaterialIcons name="push-pin" size={18} color={'#ff8a00'} />
+                                            </TouchableOpacity>
                                         </View>
+                                    )}
+
+                                    {/* Below: tiles */}
+                                    <View style={{ paddingHorizontal: gridPadding }}>
+                                        {/* If pinned, show screenshare as a normal tile */}
+                                        {isPinnedRemote && (
+                                            <View style={{
+                                                width: tileWidth,
+                                                height: tileHeight,
+                                                borderRadius: 16,
+                                                overflow: 'hidden',
+                                                backgroundColor: 'rgb(25,25,25)',
+                                                marginBottom: gridGap,
+                                            }}>
+                                                <RTCView
+                                                    key={`screenshare-small-1to1-${activeScreenShare?.userId}-${activeScreenShare?.stream?.id || 's'}`}
+                                                    streamURL={activeScreenShare.stream.toURL()}
+                                                    objectFit="contain"
+                                                    style={StyleSheet.absoluteFill}
+                                                    zOrder={0}
+                                                    mirror={false}
+                                                />
+                                                <View style={{
+                                                    position: 'absolute',
+                                                    left: 8,
+                                                    bottom: 8,
+                                                    backgroundColor: 'rgba(0,0,0,0.35)',
+                                                    paddingHorizontal: 8,
+                                                    paddingVertical: 4,
+                                                    borderRadius: 12,
+                                                }}>
+                                                    <Text style={{ color: 'white', fontWeight: '700' }} numberOfLines={1}>
+                                                        {title}
+                                                    </Text>
+                                                </View>
+                                            </View>
+                                        )}
+
+                                        {/* Remote camera tile (group-like size) - hide when it's pinned */}
+                                        {!isPinnedRemote && (
+                                            <View style={{
+                                                width: tileWidth,
+                                                height: tileHeight,
+                                                borderRadius: 16,
+                                                overflow: 'hidden',
+                                                backgroundColor: 'rgb(25,25,25)',
+                                            }}>
+                                                {canRenderRemote ? (
+                                                    <RTCView
+                                                        key={`remote-tile-${remoteStream.id}-${remoteStreamTracksCount}`}
+                                                        streamURL={remoteStream.toURL()}
+                                                        objectFit="cover"
+                                                        style={StyleSheet.absoluteFill}
+                                                        zOrder={0}
+                                                        mirror={false}
+                                                    />
+                                                ) : (
+                                                    <View style={[StyleSheet.absoluteFill, { justifyContent: 'center', alignItems: 'center' }]}>
+                                                        <Avatar.Text
+                                                            size={56}
+                                                            label={(remoteDisplayName || 'U').slice(0, 1).toUpperCase()}
+                                                            style={{ backgroundColor: 'rgb(60,60,60)' }}
+                                                        />
+                                                        <Text style={{ color: 'white', marginTop: 8, fontWeight: '700' }} numberOfLines={1}>
+                                                            {remoteDisplayName}
+                                                        </Text>
+                                                        <Text style={{ color: 'rgba(255,255,255,0.7)', marginTop: 4 }}>
+                                                            {remoteVideoMuted ? 'Video is off' : 'Connecting…'}
+                                                        </Text>
+                                                    </View>
+                                                )}
+                                                <View style={{
+                                                    position: 'absolute',
+                                                    left: 8,
+                                                    bottom: 8,
+                                                    backgroundColor: 'rgba(0,0,0,0.35)',
+                                                    paddingHorizontal: 8,
+                                                    paddingVertical: 4,
+                                                    borderRadius: 12,
+                                                }}>
+                                                    <Text style={{ color: 'white', fontWeight: '700' }} numberOfLines={1}>
+                                                        {remoteDisplayName}
+                                                    </Text>
+                                                </View>
+                                                {/* Pin icon for remote tile (tile UI only) */}
+                                                <TouchableOpacity
+                                                    onPress={() => setPinnedTileUserId((prev) => (normalizeId(prev) === remoteIdStr ? null : remoteIdStr))}
+                                                    activeOpacity={0.8}
+                                                    style={{
+                                                        position: 'absolute',
+                                                        right: 10,
+                                                        top: 10,
+                                                        zIndex: 50,
+                                                        elevation: 50,
+                                                        backgroundColor: 'rgba(0,0,0,0.35)',
+                                                        paddingHorizontal: 8,
+                                                        paddingVertical: 6,
+                                                        borderRadius: 14,
+                                                    }}
+                                                >
+                                                    <MaterialIcons name="push-pin" size={18} color={isPinnedRemote ? '#ff8a00' : 'white'} />
+                                                </TouchableOpacity>
+                                            </View>
+                                        )}
                                     </View>
-                                </View>
+                                </ScrollView>
                             );
                         })()
                     ) : null}
@@ -988,19 +1275,19 @@ const VideoCall = ({navigation}) => {
                                         const canRenderRemote = !remoteVideoMuted && hasRemoteVideoTrack && typeof remoteStream?.toURL === 'function';
 
                                         if (canRenderRemote) {
-                            return (
-                                <RTCView
+                                            return (
+                                                <RTCView
                                                     key={`remote-${remoteStream.id}-${remoteStreamTracksCount}`}
                                                     streamURL={remoteStream.toURL()}
-                                    objectFit="cover"
-                                    style={StyleSheet.absoluteFill}
-                                    zOrder={0}
-                                    mirror={false}
-                                />
-                            );
-                        }
+                                                    objectFit="cover"
+                                                    style={StyleSheet.absoluteFill}
+                                                    zOrder={0}
+                                                    mirror={false}
+                                                />
+                                            );
+                                        }
 
-                                        const statusText = remoteVideoMuted ? 'Video is off' : 'Connecting…';
+                            const statusText = remoteVideoMuted ? 'Video is off' : 'Connecting…';
                             return (
                                 <View style={[
                                     StyleSheet.absoluteFill, 

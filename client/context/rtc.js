@@ -8,7 +8,7 @@ import {
 import InCallManager from 'react-native-incall-manager';
 import RNCallKeep from 'react-native-callkeep';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Platform, AppState, Alert } from 'react-native';
+import { Platform, AppState, Alert, NativeEventEmitter, NativeModules } from 'react-native';
 import { useSelector } from 'react-redux';
 import uuid from 'react-native-uuid';
 import { navigate, popToTop, replace, navigationRef } from '../utils/staticNavigationutils';
@@ -86,10 +86,13 @@ export const RTCProvider = ({ children }) => {
 
   const [activeScreenShare, setActiveScreenShare] = useState(null); // { userId, stream, isLocal, aspectRatio }
   const [isStartingScreenShare, setIsStartingScreenShare] = useState(false);
+  const broadcastActiveRef = useRef(false);
+  const broadcastWaitersRef = useRef([]); // array of resolvers for broadcastStarted waits
   // iOS background behavior: camera capture usually stops when app backgrounds.
   // We proactively signal "video off" so peers don't see a frozen frame.
   const appStateRef = useRef(AppState.currentState || 'active');
   const autoVideoMutedRef = useRef(false);
+  const bgVideoMuteTimerRef = useRef(null);
   // Map of { [userIdStr]: { firstName, lastName, username } } from calls server for non-contact name fallback.
   const participantsInfoRef = useRef({});
   const callUUID = useRef(null);
@@ -417,7 +420,7 @@ export const RTCProvider = ({ children }) => {
         ...(existingCallData || {}), // Preserve any VoIP push data (may override with more recent socket data)
       };
       await AsyncStorage.setItem('incomingCallData', JSON.stringify(callData));
-      
+
 
       // Signal that setup is complete (only if promise exists and hasn't been resolved)
       if (incomingCallSetupComplete.current) {
@@ -834,20 +837,37 @@ export const RTCProvider = ({ children }) => {
       appStateRef.current = nextState;
 
       // Leaving foreground
-      if ((nextState === 'inactive' || nextState === 'background') && prev === 'active') {
+      // iOS commonly transitions: active -> inactive -> background.
+      // We only want to auto-mute when we truly reach background (not merely inactive).
+      if (nextState === 'background' && (prev === 'active' || prev === 'inactive')) {
+        // Debounce: iOS can briefly go inactive during CallKit accept/join transitions.
+        // Only treat as background if it stays background for a short window.
         try {
-          if (!currentCallId.current) return;
-          if ((info?.type || '') !== 'video') return;
-          const videoProducer = producers.current.get('video');
-          if (!videoProducer) return;
+          if (bgVideoMuteTimerRef.current) clearTimeout(bgVideoMuteTimerRef.current);
+        } catch {}
 
-          // Only auto-mute if video is currently ON (don't override manual mute).
-          if (videoStatus === false) return;
+        bgVideoMuteTimerRef.current = setTimeout(() => {
+          try {
+            if (appStateRef.current !== 'background') return;
+            if (!currentCallId.current) return;
+            if ((info?.type || '') !== 'video') return;
+            const videoProducer = producers.current.get('video');
+            if (!videoProducer) return;
 
-          autoVideoMutedRef.current = true;
-          socket.current?.emit?.('mute-video', { callId: currentCallId.current, producerId: videoProducer.id, muted: true });
-          setVideoStatus(false);
-        } catch (e) {}
+            // Only auto-mute if user hasn't manually turned video off.
+            if (videoStatus === false) return;
+
+            autoVideoMutedRef.current = true;
+            socket.current?.emit?.('mute-video', { callId: currentCallId.current, producerId: videoProducer.id, muted: true });
+
+            // IMPORTANT: don't flip `videoStatus` (that's user intent / UI control).
+            // For group UI correctness, update the local participant's mute state instead.
+            try {
+              const myIdStr = user?.data?.id?.toString?.() ?? (user?.data?.id != null ? String(user.data.id) : null);
+              if (myIdStr) updateParticipantMute(myIdStr, 'video', true);
+            } catch {}
+          } catch (e) {}
+        }, 600);
       }
 
       // Returning foreground
@@ -861,16 +881,26 @@ export const RTCProvider = ({ children }) => {
           const videoProducer = producers.current.get('video');
           if (!videoProducer) return;
 
+          // Only auto-unmute if user hasn't manually turned video off while away.
+          if (videoStatus === false) return;
+
           socket.current?.emit?.('mute-video', { callId: currentCallId.current, producerId: videoProducer.id, muted: false });
-          setVideoStatus(true);
+          try {
+            const myIdStr = user?.data?.id?.toString?.() ?? (user?.data?.id != null ? String(user.data.id) : null);
+            if (myIdStr) updateParticipantMute(myIdStr, 'video', false);
+          } catch {}
         } catch (e) {}
       }
     });
 
     return () => {
+      try {
+        if (bgVideoMuteTimerRef.current) clearTimeout(bgVideoMuteTimerRef.current);
+        bgVideoMuteTimerRef.current = null;
+      } catch {}
       try { sub?.remove?.(); } catch {}
     };
-  }, [info?.type, videoStatus]);
+  }, [info?.type, videoStatus, user?.data?.id]);
 
   /* ================= DEVICE ================= */
 
@@ -1253,7 +1283,7 @@ export const RTCProvider = ({ children }) => {
             return;
           }
           rtcDbg('sendTransport.connect.ok', { callId: payload.callId, transportId: payload.transportId });
-          cb();
+            cb();
         });
       } catch (error) {
         console.error('❌ [RTC] connect-transport socket error (send)', error);
@@ -1267,13 +1297,13 @@ export const RTCProvider = ({ children }) => {
 
       try {
         rtcDbg('sendTransport.produce', { callId: currentCallId.current, transportId: params?.id, kind, source: appData?.source });
-        socket.current.emit(
-          'create-producer',
-          {
-            callId: currentCallId.current,
-            transportId: params.id,
-            kind,
-            rtpParameters,
+      socket.current.emit(
+        'create-producer',
+        {
+          callId: currentCallId.current,
+          transportId: params.id,
+          kind,
+          rtpParameters,
             appData: appData && typeof appData === 'object' ? appData : undefined,
           },
           (response) => {
@@ -1285,9 +1315,9 @@ export const RTCProvider = ({ children }) => {
             }
             const producerId = response?.producerId;
             rtcDbg('sendTransport.produce.ok', { callId: currentCallId.current, kind, producerId });
-            cb({ id: producerId });
-          }
-        );
+          cb({ id: producerId });
+        }
+      );
       } catch (error) {
         console.error('❌ [RTC] Create-producer socket error:', error);
         rtcDbg('sendTransport.produce.exception', { message: error?.message || String(error) });
@@ -1388,11 +1418,11 @@ export const RTCProvider = ({ children }) => {
   /* ================= PRODUCE ================= */
 
   const produce = async (stream, callType) => {
-
+    
     const audio = stream.getAudioTracks()[0];
     const video = stream.getVideoTracks()[0];
 
-    
+
     if (audio) {
       const producer = await sendTransport.current.produce({ track: audio });
       producers.current.set('audio', producer);
@@ -1541,34 +1571,34 @@ export const RTCProvider = ({ children }) => {
       (Array.isArray(info?.participants) && info.participants.length > 2);
 
     try {
-      const data = await new Promise((resolve, reject) => {
+    const data = await new Promise((resolve, reject) => {
         rtcDbg('create-consumer.emit', { callId: currentCallId.current, producerId, userId: userIdStr });
-        socket.current.emit(
-          'create-consumer',
-          {
-            callId: currentCallId.current,
-            producerId,
-            rtpCapabilities: device.current.rtpCapabilities,
-          },
-          (response) => {
-            if (response.error) {
+      socket.current.emit(
+        'create-consumer',
+        {
+          callId: currentCallId.current,
+          producerId,
+          rtpCapabilities: device.current.rtpCapabilities,
+        },
+        (response) => {
+          if (response.error) {
               console.error('❌ [RTC] create-consumer failed', { producerId, error: response.error });
               rtcDbg('create-consumer.error', { callId: currentCallId.current, producerId, error: response.error });
-              reject(new Error(response.error));
-            } else {
+            reject(new Error(response.error));
+          } else {
               rtcDbg('create-consumer.ok', {
                 callId: currentCallId.current,
                 producerId,
                 kind: response?.kind,
                 consumerId: response?.id,
               });
-              resolve(response);
-            }
+            resolve(response);
           }
-        );
-      });
+        }
+      );
+    });
 
-      const consumer = await recvTransport.current.consume(data);
+    const consumer = await recvTransport.current.consume(data);
       rtcDbg('recvTransport.consume.ok', { producerId, consumerId: consumer?.id, kind: consumer?.kind, userId: userIdStr });
     
       // Store consumer with userId mapping
@@ -1579,18 +1609,18 @@ export const RTCProvider = ({ children }) => {
         source: sourceStr,
       });
     
-      socket.current.emit('resume-consumer', {
-        callId: currentCallId.current,
-        consumerId: consumer.id,
-      }, (response) => {
-        if (response?.error) {
+    socket.current.emit('resume-consumer', {
+      callId: currentCallId.current,
+      consumerId: consumer.id,
+    }, (response) => {
+      if (response?.error) {
           rtcDbg('resume-consumer.error', { consumerId: consumer.id, error: response.error });
-        } else {
+      } else {
           rtcDbg('resume-consumer.ok', { consumerId: consumer.id, ...response });
-        }
-      });
+      }
+    });
     
-      await consumer.resume();
+    await consumer.resume();
       rtcDbg('consumer.resume.client_ok', { consumerId: consumer?.id, kind: consumer?.kind });
       
 
@@ -1598,8 +1628,8 @@ export const RTCProvider = ({ children }) => {
     // We render it separately as a pinned "presentation" tile.
     if (sourceStr === 'screen' && consumer?.kind === 'video') {
       try {
-        const track = consumer.track;
-        if (track) {
+    const track = consumer.track;
+    if (track) {
           const s = new MediaStream();
           s.addTrack(track);
           let ar = null;
@@ -1678,8 +1708,8 @@ export const RTCProvider = ({ children }) => {
         isGroupCall,
       });
       
-      const initialMutedState = track.muted;
-      const initialEnabledState = track.enabled;
+        const initialMutedState = track.muted;
+        const initialEnabledState = track.enabled;
         
         // Track audio track state
         if (track.kind === 'audio') {
@@ -1719,25 +1749,25 @@ export const RTCProvider = ({ children }) => {
             const handleAudioEnabledChange = () => {
               const isMicOn = track.enabled && !track.muted;
               setMicStatus(isMicOn);
-            };
-            
-            if (track.addEventListener) {
+          };
+          
+          if (track.addEventListener) {
               track.addEventListener('mute', handleAudioMute);
               track.addEventListener('unmute', handleAudioUnmute);
-            } else if (track.onmute !== undefined) {
+          } else if (track.onmute !== undefined) {
               track.onmute = handleAudioMute;
               track.onunmute = handleAudioUnmute;
-            }
-            
+          }
+          
             // Poll for enabled state changes (since there's no event)
             const audioEnabledCheckInterval = setInterval(() => {
-              const currentEnabled = track.enabled;
+            const currentEnabled = track.enabled;
               if (currentEnabled !== track._lastAudioEnabledState) {
                 track._lastAudioEnabledState = currentEnabled;
                 handleAudioEnabledChange();
-              }
-            }, 500);
-            
+            }
+          }, 500);
+          
             track._lastAudioEnabledState = track.enabled;
             track._audioEnabledCheckInterval = audioEnabledCheckInterval;
             
@@ -1801,7 +1831,7 @@ export const RTCProvider = ({ children }) => {
       if (tracksCount !== lastRemoteStreamTracksCount.current || !remoteStreamSetRef.current) {
         lastRemoteStreamTracksCount.current = tracksCount;
         setRemoteStream(remoteCompositeStream);
-        setRemoteStreamTracksCount(tracksCount);
+    setRemoteStreamTracksCount(tracksCount);
         remoteStreamSetRef.current = true;
         rtcDbg('remoteStream.updated', {
           userId: userIdStr,
@@ -1839,6 +1869,52 @@ export const RTCProvider = ({ children }) => {
 
   /* ================= SCREEN SHARE ================= */
 
+  // Wait for ReplayKit broadcast extension to actually start (Darwin notification).
+  // This is more reliable than track.muted, which can be inconsistent across iOS versions/devices.
+  const waitForBroadcastStarted = ({ timeoutMs = 8000 } = {}) => {
+    if (Platform.OS !== 'ios') return Promise.resolve(true);
+    if (broadcastActiveRef.current) return Promise.resolve(true);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('Broadcast was not started.'));
+      }, timeoutMs);
+      broadcastWaitersRef.current.push(() => {
+        try { clearTimeout(timer); } catch {}
+        resolve(true);
+      });
+    });
+  };
+
+  // Listen for broadcast start/stop signals from the Upload Extension.
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return;
+    const mod = NativeModules?.BroadcastEvents;
+    if (!mod) return;
+    const emitter = new NativeEventEmitter(mod);
+
+    const subStart = emitter.addListener('broadcastStarted', () => {
+      broadcastActiveRef.current = true;
+      const waiters = broadcastWaitersRef.current.splice(0);
+      waiters.forEach((fn) => {
+        try { fn(); } catch {}
+      });
+    });
+    const subStop = emitter.addListener('broadcastStopped', () => {
+      broadcastActiveRef.current = false;
+      // If we were sharing locally, ensure we cleanup UI + producer.
+      try {
+        if (screenProducerRef.current) {
+          stopScreenShare();
+        }
+      } catch {}
+    });
+
+    return () => {
+      try { subStart?.remove?.(); } catch {}
+      try { subStop?.remove?.(); } catch {}
+    };
+  }, []);
+
   const startScreenShare = async () => {
     if (isStartingScreenShare) return;
     if (!currentCallId.current) {
@@ -1863,6 +1939,8 @@ export const RTCProvider = ({ children }) => {
 
     setIsStartingScreenShare(true);
     try {
+      // On iOS, only start getDisplayMedia after the broadcast extension is actually running.
+      await waitForBroadcastStarted({ timeoutMs: 8000 });
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
       const track = stream?.getVideoTracks?.()?.[0];
       if (!track) {
@@ -1881,10 +1959,15 @@ export const RTCProvider = ({ children }) => {
         track.enabled = true;
       } catch (e) {}
 
+      const producer = await sendTransport.current.produce({
+        track,
+        appData: { source: 'screen' },
+      });
+      screenProducerRef.current = producer;
+
       // Use the native-backed MediaStream returned by getDisplayMedia for local preview.
       // (Derived streams can be flaky for ReplayKit tracks on iOS.)
       const previewStream = stream;
-
       setActiveScreenShare({
         userId: user?.data?.id?.toString?.() ?? String(user?.data?.id),
         stream: previewStream,
@@ -1898,17 +1981,10 @@ export const RTCProvider = ({ children }) => {
           if (!screenProducerRef.current) return;
           setActiveScreenShare(prev => {
             if (!prev?.isLocal) return prev;
-            // Re-assign to a fresh object to force RTCView remount keyed by stream id/props.
             return { ...prev, stream: stream };
           });
         } catch (e) {}
       }, 700);
-
-      const producer = await sendTransport.current.produce({
-        track,
-        appData: { source: 'screen' },
-      });
-      screenProducerRef.current = producer;
 
       track.onended = () => {
         stopScreenShare();
@@ -1991,14 +2067,14 @@ export const RTCProvider = ({ children }) => {
 
     try {
       
-      const stream = await getLocalStream(callType);
+    const stream = await getLocalStream(callType);
       
-      setLocalStream(stream);
+    setLocalStream(stream);
 
       
-      
-      socket.current.emit(
-        'start-call',
+
+    socket.current.emit(
+      'start-call',
         { toUserIds: participantIds, callType }, // Send array
         async (response) => {
           
@@ -2012,7 +2088,7 @@ export const RTCProvider = ({ children }) => {
           const { callId, rtpCapabilities } = response;
           
 
-          currentCallId.current = callId;
+        currentCallId.current = callId;
 
           // Use callId as UUID for CallKeep (instead of generating new one)
           callUUID.current = callId;
@@ -2020,7 +2096,7 @@ export const RTCProvider = ({ children }) => {
 
           try {
             
-            await initDevice(rtpCapabilities);
+        await initDevice(rtpCapabilities);
             
             const joinCall = () =>
               new Promise((resolve, reject) => {
@@ -2072,8 +2148,8 @@ export const RTCProvider = ({ children }) => {
               } else {
                 participantManager.current.initializeParticipants(participantIds, user, stream, contacts, true);
               }
-
-              await produce(stream, callType);
+        
+        await produce(stream, callType);
 
               const existing = await getProducers();
               if (Array.isArray(existing) && existing.length) {
@@ -2112,7 +2188,7 @@ export const RTCProvider = ({ children }) => {
 
             
             try {
-              InCallManager.start({ ringback: 'DEFAULT' });
+        InCallManager.start({ ringback: 'DEFAULT' });
               
             } catch (e) {
               
@@ -2366,8 +2442,8 @@ export const RTCProvider = ({ children }) => {
 
     try {
       await new Promise((resolve, reject) => {
-        socket.current.emit(
-          'accept-call',
+    socket.current.emit(
+      'accept-call',
           { callId: callIdToUse, fromUserId: userIdToUse },
           async (response) => {
             try {
@@ -2854,7 +2930,7 @@ export const RTCProvider = ({ children }) => {
           track.stop();
           track.enabled = false;
           
-        } catch (e) {
+      } catch (e) {
           console.error('❌ [RTC] Error stopping local track:', e);
         }
       });
@@ -2879,7 +2955,7 @@ export const RTCProvider = ({ children }) => {
         }
           if (track._audioEnabledCheckInterval) {
             clearInterval(track._audioEnabledCheckInterval);
-          }
+        }
         if (track._muteEventTimeout) {
           clearTimeout(track._muteEventTimeout);
           track._muteEventTimeout = null;
@@ -3116,6 +3192,7 @@ export const RTCProvider = ({ children }) => {
         isStartingScreenShare,
         startScreenShare,
         stopScreenShare,
+        waitForBroadcastStarted,
       }}
     >
       {children}

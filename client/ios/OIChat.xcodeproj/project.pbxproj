@@ -18,6 +18,7 @@
 		9FC7A1CB4635BBDA53B50C51 /* libPods-OIChat.a in Frameworks */ = {isa = PBXBuildFile; fileRef = B6314673D4D10B3887C00182 /* libPods-OIChat.a */; };
 		BB2F792D24A3F905000567C9 /* Expo.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB2F792C24A3F905000567C9 /* Expo.plist */; };
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
+		F1B0C0A12F2A0E0E00E1C0DE /* BroadcastEvents.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1B0C0A02F2A0E0E00E1C0DE /* BroadcastEvents.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -63,6 +64,7 @@
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 		F11748412D0307B40044C1D9 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = OIChat/AppDelegate.swift; sourceTree = "<group>"; };
 		F11748442D0722820044C1D9 /* OIChat-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "OIChat-Bridging-Header.h"; path = "OIChat/OIChat-Bridging-Header.h"; sourceTree = "<group>"; };
+		F1B0C0A02F2A0E0E00E1C0DE /* BroadcastEvents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = BroadcastEvents.swift; path = OIChat/BroadcastEvents.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -105,6 +107,7 @@
 			isa = PBXGroup;
 			children = (
 				F11748412D0307B40044C1D9 /* AppDelegate.swift */,
+				F1B0C0A02F2A0E0E00E1C0DE /* BroadcastEvents.swift */,
 				F11748442D0722820044C1D9 /* OIChat-Bridging-Header.h */,
 				BB2F792B24A3F905000567C9 /* Supporting */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
@@ -446,6 +449,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */,
+				F1B0C0A12F2A0E0E00E1C0DE /* BroadcastEvents.swift in Sources */,
 				375B6BF65B4C291392550C0D /* ExpoModulesProvider.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

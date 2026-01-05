@@ -5,11 +5,6 @@ import VoipPushNotification from "react-native-voip-push-notification";
 import { registerGlobals } from 'react-native-webrtc';
 import App from './App';
 
-const options = {
-    ios:{
-        appName:'OIChat'
-    }
-}
 
 registerGlobals();
 global.__RTC_DEBUG__ = true;
